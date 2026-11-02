@@ -790,6 +790,24 @@ mod tests {
         assert_eq!(q.add_to_queue(track("overflow")), Err(QueueFullError));
     }
 
+    #[test]
+    fn add_at_limit_leaves_contents_and_pointer_unchanged() {
+        // At exactly MAX_QUEUE_LEN both add_to_queue and play_next are rejected
+        // and leave the full Queue contents and current-track pointer unchanged
+        // (Requirement 5.12).
+        let mut q = Queue::new();
+        q.tracks = (0..MAX_QUEUE_LEN).map(|i| track(&i.to_string())).collect();
+        q.current = Some(4_200);
+        // Snapshot the entire Queue to detect any mutation, not just length.
+        let snapshot = q.clone();
+
+        assert_eq!(q.add_to_queue(track("overflow-add")), Err(QueueFullError));
+        assert_eq!(q, snapshot);
+
+        assert_eq!(q.play_next(track("overflow-next")), Err(QueueFullError));
+        assert_eq!(q, snapshot);
+    }
+
     // --- shuffle (R5.6) ---
 
     /// A deterministic permutation that reverses the suffix, used to assert the
@@ -1142,5 +1160,1048 @@ mod tests {
     fn finished_on_empty_queue_is_none() {
         let q = Queue::new();
         assert_eq!(q.track_finished_transition(RepeatMode::Off), None);
+    }
+
+    // --- property: play-next insertion (R5.2) ---
+
+    use proptest::prelude::*;
+
+    /// Build a Queue of distinct-id tracks `t0..tn` with the given pointer.
+    fn queue_with_len(len: usize, current: Option<usize>) -> Queue {
+        let mut q = Queue::new();
+        for i in 0..len {
+            q.add_to_queue(track(&format!("t{i}"))).unwrap();
+        }
+        q.current = current;
+        q
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 9: Play-next inserts after the current track
+        // Validates: Requirements 5.2
+        //
+        // For any Queue and track, play_next places the inserted track at the
+        // position immediately after the current track, keeping the pointer on
+        // the same current track and leaving every other track's relative order
+        // unchanged. When the Queue has no current track, the inserted track
+        // becomes the sole current track (current == 0) without any implied
+        // playback state change.
+        #[test]
+        fn property_play_next_inserts_after_current(
+            // Keep lengths well under MAX_QUEUE_LEN so the add always succeeds.
+            len in 0usize..30,
+            // An arbitrary pointer choice that we clamp into range (or None for
+            // an empty queue) below.
+            ptr_seed in 0usize..30,
+        ) {
+            let current = if len == 0 {
+                None
+            } else {
+                Some(ptr_seed % len)
+            };
+            let mut q = queue_with_len(len, current);
+
+            // A new track whose id cannot collide with the existing t0..tn ids.
+            let inserted = track("inserted");
+            let before_ids = ids(&q);
+            let before_current_id = current_id(&q);
+
+            q.play_next(inserted.clone()).unwrap();
+
+            // Exactly one track was added.
+            prop_assert_eq!(q.len(), before_ids.len() + 1);
+
+            match current {
+                None => {
+                    // Empty queue: the inserted track is now the sole current
+                    // track, without changing anything else about the queue.
+                    prop_assert_eq!(ids(&q), vec!["inserted".to_string()]);
+                    prop_assert_eq!(q.current, Some(0));
+                }
+                Some(cur) => {
+                    // The inserted track sits immediately after the current one.
+                    prop_assert_eq!(&q.tracks[cur + 1].track_id, "inserted");
+
+                    // The pointer still names the same current track.
+                    prop_assert_eq!(current_id(&q), before_current_id);
+
+                    // Every other track keeps its relative order: removing the
+                    // inserted track recovers the original id sequence.
+                    let mut without_inserted = ids(&q);
+                    without_inserted.remove(cur + 1);
+                    prop_assert_eq!(without_inserted, before_ids);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod remove_property_tests {
+    //! Property-based test for removing a non-current track (task 5.6). Runs the
+    //! single design correctness property at >=100 iterations.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Build a Queue of `n` tracks with ids `t0..t{n-1}` and the given current
+    /// pointer. Ids are unique so track identity is unambiguous.
+    fn queue_with(n: usize, current: usize) -> Queue {
+        let mut q = Queue::new();
+        for i in 0..n {
+            let id = format!("t{i}");
+            q.add_to_queue(QueueTrack {
+                track_id: id.clone(),
+                title: format!("Title {id}"),
+                artist: format!("Artist {id}"),
+                duration_ms: Some(180_000),
+            })
+            .unwrap();
+        }
+        q.current = Some(current);
+        q
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 11: Removing a non-current track preserves order and pointer
+        //
+        // Validates: Requirements 5.4
+        //
+        // For any Queue and any index other than the current one, removing that
+        // track reduces the length by one, preserves the relative order of the
+        // remaining tracks, and keeps the current-track pointer on the same
+        // track identity.
+        //
+        // The generator builds a Queue of 2..=50 tracks (at least two so a
+        // non-current index always exists), picks a current pointer inside the
+        // queue, and picks a removal index that is guaranteed distinct from the
+        // current one. This matches the real input space of `remove`: it rejects
+        // out-of-range and current-track indices, so the property targets the
+        // accepted non-current removals.
+        #[test]
+        fn property_remove_non_current_preserves_order_and_pointer(
+            len in 2usize..=50,
+            current_frac in 0.0f64..1.0,
+            remove_offset_frac in 0.0f64..1.0,
+        ) {
+            let current = ((current_frac * len as f64) as usize).min(len - 1);
+
+            // Choose a removal index in 0..len-1 then skip past `current`, so it
+            // lands uniformly on one of the `len - 1` non-current indices.
+            let raw = ((remove_offset_frac * (len - 1) as f64) as usize).min(len - 2);
+            let remove_index = if raw >= current { raw + 1 } else { raw };
+
+            let mut q = queue_with(len, current);
+
+            // Snapshot pre-removal state.
+            let ids_before: Vec<String> =
+                q.tracks.iter().map(|t| t.track_id.clone()).collect();
+            let current_id_before = q.tracks[current].track_id.clone();
+            let removed_id = q.tracks[remove_index].track_id.clone();
+
+            let removed = q.remove(remove_index);
+
+            // Removing a valid non-current index always succeeds.
+            prop_assert!(removed);
+
+            // Length reduced by exactly one.
+            prop_assert_eq!(q.len(), len - 1);
+
+            // Relative order of the remaining tracks is preserved: the surviving
+            // ids equal the original ids with the removed one deleted.
+            let expected_ids: Vec<String> = ids_before
+                .iter()
+                .filter(|id| **id != removed_id)
+                .cloned()
+                .collect();
+            let ids_after: Vec<String> =
+                q.tracks.iter().map(|t| t.track_id.clone()).collect();
+            prop_assert_eq!(ids_after, expected_ids);
+
+            // The pointer still refers to the same track identity.
+            let current_after = q.current.expect("non-empty queue keeps a pointer");
+            prop_assert_eq!(&q.tracks[current_after].track_id, &current_id_before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    //! Property-based tests for the structural Queue operations.
+    //!
+    //! Each test exercises one design correctness property at >=100 iterations.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for a single `QueueTrack` with arbitrary-but-bounded metadata.
+    /// Track ids are drawn from a small alphabet so generated queues can hold
+    /// repeated ids; the add-to-queue property does not rely on id uniqueness.
+    fn queue_track() -> impl Strategy<Value = QueueTrack> {
+        (
+            "[a-z0-9]{1,8}",
+            ".{0,16}",
+            ".{0,16}",
+            proptest::option::of(0u64..600_000),
+        )
+            .prop_map(|(track_id, title, artist, duration_ms)| QueueTrack {
+                track_id,
+                title,
+                artist,
+                duration_ms,
+            })
+    }
+
+    /// Strategy for an arbitrary (and internally consistent) `Queue`: either an
+    /// empty queue, or a non-empty list with a current index somewhere inside
+    /// it. This matches the Queue invariant (`current` is `None` iff empty).
+    fn arb_queue() -> impl Strategy<Value = Queue> {
+        proptest::collection::vec(queue_track(), 0..32).prop_flat_map(|tracks| {
+            if tracks.is_empty() {
+                Just(Queue {
+                    tracks,
+                    current: None,
+                    pre_shuffle_order: None,
+                })
+                .boxed()
+            } else {
+                let len = tracks.len();
+                (Just(tracks), 0..len)
+                    .prop_map(|(tracks, current)| Queue {
+                        tracks,
+                        current: Some(current),
+                        pre_shuffle_order: None,
+                    })
+                    .boxed()
+            }
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 10: Add-to-queue appends
+        // Validates: Requirements 5.3
+        #[test]
+        fn add_to_queue_appends(queue in arb_queue(), new_track in queue_track()) {
+            let mut q = queue.clone();
+            let had_current = q.current;
+            let old_tracks = q.tracks.clone();
+
+            q.add_to_queue(new_track.clone()).unwrap();
+
+            // The track is placed after the last existing track: the list grew
+            // by exactly one and the new last entry is the added track, while
+            // every prior track keeps its position and identity.
+            prop_assert_eq!(q.tracks.len(), old_tracks.len() + 1);
+            prop_assert_eq!(q.tracks.last(), Some(&new_track));
+            prop_assert_eq!(&q.tracks[..old_tracks.len()], &old_tracks[..]);
+
+            match had_current {
+                // Non-empty queue: the current-track pointer is untouched, so no
+                // playback starts on a different track.
+                Some(current) => prop_assert_eq!(q.current, Some(current)),
+                // Empty queue: the appended track becomes the sole current track
+                // (index 0) without starting playback (the Queue state carries
+                // no playback flag; it is simply made current).
+                None => prop_assert_eq!(q.current, Some(0)),
+            }
+        }
+    }
+
+    /// Strategy for a non-empty `Queue` with unique, sequential track ids
+    /// (`t0..tN`) plus a current index inside it. Unique ids let the move
+    /// property track the moved track and the other tracks by identity.
+    fn arb_nonempty_queue_unique_ids() -> impl Strategy<Value = Queue> {
+        (1usize..32).prop_flat_map(|len| {
+            let tracks: Vec<QueueTrack> = (0..len)
+                .map(|i| QueueTrack {
+                    track_id: format!("t{i}"),
+                    title: format!("Title {i}"),
+                    artist: format!("Artist {i}"),
+                    duration_ms: Some(180_000),
+                })
+                .collect();
+            (Just(tracks), 0..len).prop_map(|(tracks, current)| Queue {
+                tracks,
+                current: Some(current),
+                pre_shuffle_order: None,
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 12: Move clamps target and preserves other tracks
+        // Validates: Requirements 5.5
+        //
+        // For any non-empty Queue, source position `from`, and target position
+        // `target`, moving the track at `from` places it at the target clamped
+        // to the inclusive 1-based range 1..=len (0-based destination
+        // `target.clamp(1, len) - 1`), preserves the relative order of all
+        // other tracks, and keeps the current-track pointer on the same track
+        // identity. `target` is drawn from 0..len+3 so below-range (0) and
+        // above-range (>len) targets are exercised alongside in-range ones.
+        #[test]
+        fn move_clamps_target_and_preserves_other_tracks(
+            queue in arb_nonempty_queue_unique_ids(),
+            from_sel in any::<usize>(),
+            target_sel in any::<usize>(),
+        ) {
+            let len = queue.tracks.len();
+            let from = from_sel % len;
+            let target = target_sel % (len + 3);
+
+            let mut q = queue.clone();
+            let ids = |q: &Queue| -> Vec<String> {
+                q.tracks.iter().map(|t| t.track_id.clone()).collect()
+            };
+            let current_id = |q: &Queue| -> Option<String> {
+                q.current.map(|i| q.tracks[i].track_id.clone())
+            };
+
+            let original_ids = ids(&q);
+            let moved_id = original_ids[from].clone();
+            let current_identity = current_id(&q);
+            let others_before: Vec<String> = original_ids
+                .iter()
+                .filter(|id| *id != &moved_id)
+                .cloned()
+                .collect();
+
+            // A valid source position is always accepted.
+            prop_assert!(q.move_track(from, target));
+
+            // Length and the full set of tracks are preserved.
+            prop_assert_eq!(q.tracks.len(), len);
+            let mut after_sorted = ids(&q);
+            after_sorted.sort();
+            let mut before_sorted = original_ids.clone();
+            before_sorted.sort();
+            prop_assert_eq!(after_sorted, before_sorted);
+
+            // The moved track lands at the clamped 0-based destination.
+            let dest = target.clamp(1, len) - 1;
+            let actual_pos = q
+                .tracks
+                .iter()
+                .position(|t| t.track_id == moved_id)
+                .expect("moved track is still present");
+            prop_assert_eq!(actual_pos, dest);
+
+            // The relative order of every other track is unchanged.
+            let others_after: Vec<String> =
+                ids(&q).into_iter().filter(|id| id != &moved_id).collect();
+            prop_assert_eq!(others_after, others_before);
+
+            // The current-track pointer still rests on the same track identity.
+            prop_assert_eq!(current_id(&q), current_identity);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: apple-music-tui, Property 12: Move clamps target and preserves other tracks
+        // Validates: Requirements 5.5
+        //
+        // An out-of-range source position leaves the Queue entirely unchanged
+        // (tracks and current-track pointer) and reports no change.
+        #[test]
+        fn move_out_of_range_source_is_noop(
+            queue in arb_queue(),
+            from_extra in 0usize..50,
+            target in any::<usize>(),
+        ) {
+            let mut q = queue.clone();
+            // `from` is guaranteed to be at or beyond the end of the list.
+            let from = q.tracks.len() + from_extra;
+
+            prop_assert!(!q.move_track(from, target));
+            prop_assert_eq!(q, queue);
+        }
+    }
+}
+
+#[cfg(test)]
+mod shuffle_roundtrip_property_tests {
+    //! Property-based test for the shuffle/un-shuffle round-trip (task 5.9).
+    //! Runs the single design correctness property at >=100 iterations.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for a non-empty `Queue` with unique, sequential track ids
+    /// (`t0..t{n-1}`) plus a current index inside it. Unique ids let the
+    /// round-trip compare order and pointer by identity, and shuffle's real
+    /// snapshot/restore relies on distinct ids.
+    fn arb_nonempty_queue_unique_ids() -> impl Strategy<Value = Queue> {
+        (1usize..32).prop_flat_map(|len| {
+            let tracks: Vec<QueueTrack> = (0..len)
+                .map(|i| QueueTrack {
+                    track_id: format!("t{i}"),
+                    title: format!("Title {i}"),
+                    artist: format!("Artist {i}"),
+                    duration_ms: Some(180_000),
+                })
+                .collect();
+            (Just(tracks), 0..len).prop_map(|(tracks, current)| Queue {
+                tracks,
+                current: Some(current),
+                pre_shuffle_order: None,
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 14: Shuffle then un-shuffle round-trip
+        // Validates: Requirements 5.7
+        //
+        // For any Queue, enabling shuffle and then disabling it with no
+        // intervening edits restores the original track order and keeps the
+        // current-track pointer on the same track. The generator builds
+        // non-empty queues with unique ids and an arbitrary current pointer so
+        // the prefix-fixed / suffix-permuted shuffle and the id-based unshuffle
+        // restore are exercised across the whole input space.
+        #[test]
+        fn shuffle_then_unshuffle_round_trip(queue in arb_nonempty_queue_unique_ids()) {
+            let ids = |q: &Queue| -> Vec<String> {
+                q.tracks.iter().map(|t| t.track_id.clone()).collect()
+            };
+            let current_id = |q: &Queue| -> Option<String> {
+                q.current.map(|i| q.tracks[i].track_id.clone())
+            };
+
+            let original_ids = ids(&queue);
+            let original_current_id = current_id(&queue);
+
+            let mut q = queue.clone();
+            // Enable shuffle (uses the real clock-seeded permutation) then
+            // immediately disable it with no intervening edits.
+            q.shuffle();
+            q.unshuffle();
+
+            // The original track order is restored exactly.
+            prop_assert_eq!(ids(&q), original_ids);
+            // The current-track pointer rests on the same track.
+            prop_assert_eq!(current_id(&q), original_current_id);
+            // The snapshot is cleared after un-shuffle.
+            prop_assert!(q.pre_shuffle_order.is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod repeat_cycle_property_tests {
+    //! Property-based test for repeat-mode cycling (task 5.10). Runs the single
+    //! design correctness property at >=100 iterations.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy over the three repeat modes.
+    fn arb_repeat_mode() -> impl Strategy<Value = RepeatMode> {
+        prop_oneof![
+            Just(RepeatMode::Off),
+            Just(RepeatMode::RepeatAll),
+            Just(RepeatMode::RepeatOne),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 15: Repeat mode cycling
+        // Validates: Requirements 5.8
+        //
+        // For any starting repeat mode, one cycle maps Off -> RepeatAll,
+        // RepeatAll -> RepeatOne, and RepeatOne -> Off, and three consecutive
+        // cycles return to the starting mode.
+        #[test]
+        fn repeat_cycling(mode in arb_repeat_mode()) {
+            // One cycle follows the Off -> RepeatAll -> RepeatOne -> Off order.
+            let once = cycle_repeat(mode);
+            let expected_once = match mode {
+                RepeatMode::Off => RepeatMode::RepeatAll,
+                RepeatMode::RepeatAll => RepeatMode::RepeatOne,
+                RepeatMode::RepeatOne => RepeatMode::Off,
+            };
+            prop_assert_eq!(once, expected_once);
+
+            // Three consecutive cycles return to the starting mode.
+            let thrice = cycle_repeat(cycle_repeat(cycle_repeat(mode)));
+            prop_assert_eq!(thrice, mode);
+        }
+    }
+}
+
+#[cfg(test)]
+mod shuffle_property_tests {
+    //! Property-based test for enabling shuffle (task 5.8). Runs the single
+    //! design correctness property at >=100 iterations in a uniquely-named
+    //! module so it does not collide with the other `property_tests` modules.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for a non-empty `Queue` with unique, sequential track ids
+    /// (`t0..t{n-1}`) and a current index inside it. Unique ids let the
+    /// property distinguish the prefix, the current track, and the suffix by
+    /// identity and confirm the suffix is a permutation of itself.
+    fn arb_nonempty_queue_unique_ids() -> impl Strategy<Value = Queue> {
+        (1usize..32).prop_flat_map(|len| {
+            let tracks: Vec<QueueTrack> = (0..len)
+                .map(|i| QueueTrack {
+                    track_id: format!("t{i}"),
+                    title: format!("Title {i}"),
+                    artist: format!("Artist {i}"),
+                    duration_ms: Some(180_000),
+                })
+                .collect();
+            (Just(tracks), 0..len).prop_map(|(tracks, current)| Queue {
+                tracks,
+                current: Some(current),
+                pre_shuffle_order: None,
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 13: Shuffle fixes the prefix and permutes the suffix
+        // Validates: Requirements 5.6
+        //
+        // For any Queue, enabling shuffle leaves the current track and every
+        // track before it unchanged in place and reorders the tracks after the
+        // current track into a permutation of those same tracks (unchanged when
+        // one or fewer tracks follow the current track).
+        //
+        // The generator builds a non-empty Queue with unique ids and a pointer
+        // inside it, then drives shuffle through `shuffle_with` using a
+        // deterministic permutation (a rotation by one) so the assertions do
+        // not depend on the system-seeded PRNG. A rotation reorders every
+        // suffix of two or more tracks, which also lets us confirm that a
+        // suffix of two or more actually changes.
+        #[test]
+        fn shuffle_fixes_prefix_and_permutes_suffix(
+            queue in arb_nonempty_queue_unique_ids(),
+        ) {
+            let mut q = queue.clone();
+            let current = q.current.expect("non-empty queue has a pointer");
+            let len = q.tracks.len();
+
+            let ids = |q: &Queue| -> Vec<String> {
+                q.tracks.iter().map(|t| t.track_id.clone()).collect()
+            };
+
+            let before_ids = ids(&queue);
+            // The prefix is the current track and everything before it.
+            let prefix_end = current + 1;
+            let prefix_before = before_ids[..prefix_end].to_vec();
+            let suffix_before = before_ids[prefix_end..].to_vec();
+            let suffix_len = suffix_before.len();
+
+            // Deterministic permutation: rotate the suffix left by one. This is
+            // a permutation for any length and reorders every suffix of length
+            // >= 2.
+            q.shuffle_with(|suffix| {
+                if suffix.len() >= 2 {
+                    suffix.rotate_left(1);
+                }
+            });
+
+            let after_ids = ids(&q);
+
+            // Length never changes.
+            prop_assert_eq!(after_ids.len(), len);
+
+            // The pointer stays on the same track position (and so the same
+            // track identity, since the prefix is fixed).
+            prop_assert_eq!(q.current, Some(current));
+
+            // The current track and every track before it are unchanged in
+            // place.
+            prop_assert_eq!(&after_ids[..prefix_end], &prefix_before[..]);
+
+            let suffix_after = after_ids[prefix_end..].to_vec();
+
+            // The suffix is a permutation of the original suffix tracks.
+            let mut sorted_before = suffix_before.clone();
+            sorted_before.sort();
+            let mut sorted_after = suffix_after.clone();
+            sorted_after.sort();
+            prop_assert_eq!(&sorted_after, &sorted_before);
+
+            if suffix_len <= 1 {
+                // One or fewer following tracks: the Queue is left unchanged.
+                prop_assert_eq!(&suffix_after, &suffix_before);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_property_tests {
+    //! Property-based test for the transport transitions (task 5.13).
+    //!
+    //! Exercises the single design correctness property (Property 8) at >=100
+    //! iterations against `next_transition`, `previous_transition`, and
+    //! `track_finished_transition`.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Build a non-empty Queue of `len` tracks (ids `t0..t{len-1}`) with the
+    /// given current pointer. Distinct ids are not required here because the
+    /// transitions reason purely over indices, but they keep failures readable.
+    fn queue_with(len: usize, current: usize) -> Queue {
+        let mut q = Queue::new();
+        for i in 0..len {
+            let id = format!("t{i}");
+            q.add_to_queue(QueueTrack {
+                track_id: id.clone(),
+                title: format!("Title {id}"),
+                artist: format!("Artist {id}"),
+                duration_ms: Some(180_000),
+            })
+            .unwrap();
+        }
+        q.current = Some(current);
+        q
+    }
+
+    /// Enumerate the three repeat modes so each property run covers all of them.
+    fn repeat_mode() -> impl Strategy<Value = RepeatMode> {
+        prop_oneof![
+            Just(RepeatMode::Off),
+            Just(RepeatMode::RepeatAll),
+            Just(RepeatMode::RepeatOne),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 8: Transport transitions over repeat modes
+        // Validates: Requirements 4.3, 4.4, 4.5, 4.8
+        //
+        // For any Queue, current-track index, repeat mode, and (for previous)
+        // current position, the next-track, previous-track, and track-finished
+        // transitions produce the current index and play/pause status defined
+        // by the transition rules:
+        //   * next (R4.3): advance and play when a following track exists; at
+        //     the last track, wrap to index 0 playing under repeat all,
+        //     otherwise (off / repeat one) stay on the last track paused.
+        //   * previous (R4.4, R4.5): restart the current track playing when the
+        //     position is past 3 seconds or the current track is the first one;
+        //     otherwise step back one track playing. Repeat mode is irrelevant.
+        //   * track-finished (R4.8): replay the current track playing under
+        //     repeat one; otherwise advance and play when a following track
+        //     exists; at the last track wrap to index 0 playing under repeat
+        //     all and stop paused on the last track under repeat off.
+        #[test]
+        fn property_transport_transitions(
+            len in 1usize..32,
+            current_frac in 0.0f64..1.0,
+            repeat in repeat_mode(),
+            position_ms in 0u64..600_000,
+        ) {
+            let current = ((current_frac * len as f64) as usize).min(len - 1);
+            let q = queue_with(len, current);
+            let last = len - 1;
+
+            // --- next-track transition (Requirement 4.3) ---
+            let expected_next = if current < last {
+                Transition { index: current + 1, status: PlaybackStatus::Playing }
+            } else {
+                match repeat {
+                    RepeatMode::RepeatAll => {
+                        Transition { index: 0, status: PlaybackStatus::Playing }
+                    }
+                    RepeatMode::Off | RepeatMode::RepeatOne => {
+                        Transition { index: last, status: PlaybackStatus::Paused }
+                    }
+                }
+            };
+            prop_assert_eq!(q.next_transition(repeat), Some(expected_next));
+
+            // --- previous-track transition (Requirements 4.4, 4.5) ---
+            // Previous always plays and ignores repeat mode.
+            let expected_prev_index =
+                if position_ms > PREVIOUS_RESTART_THRESHOLD_MS || current == 0 {
+                    current
+                } else {
+                    current - 1
+                };
+            let expected_prev = Transition {
+                index: expected_prev_index,
+                status: PlaybackStatus::Playing,
+            };
+            // The result is independent of repeat mode, so assert it holds for
+            // the drawn mode and that every mode agrees.
+            prop_assert_eq!(q.previous_transition(position_ms), Some(expected_prev));
+            for mode_invariant_check in
+                [RepeatMode::Off, RepeatMode::RepeatAll, RepeatMode::RepeatOne]
+            {
+                let _ = mode_invariant_check; // repeat does not alter previous
+                prop_assert_eq!(
+                    q.previous_transition(position_ms),
+                    Some(expected_prev)
+                );
+            }
+
+            // --- track-finished transition (Requirement 4.8) ---
+            let expected_finished = match repeat {
+                RepeatMode::RepeatOne => {
+                    Transition { index: current, status: PlaybackStatus::Playing }
+                }
+                RepeatMode::RepeatAll => {
+                    if current < last {
+                        Transition {
+                            index: current + 1,
+                            status: PlaybackStatus::Playing,
+                        }
+                    } else {
+                        Transition { index: 0, status: PlaybackStatus::Playing }
+                    }
+                }
+                RepeatMode::Off => {
+                    if current < last {
+                        Transition {
+                            index: current + 1,
+                            status: PlaybackStatus::Playing,
+                        }
+                    } else {
+                        Transition { index: last, status: PlaybackStatus::Paused }
+                    }
+                }
+            };
+            prop_assert_eq!(
+                q.track_finished_transition(repeat),
+                Some(expected_finished)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod remove_current_property_tests {
+    //! Property-based test for removing the current track (task 5.11). Runs the
+    //! single design correctness property at >=100 iterations.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for a non-empty `Queue` with unique, sequential track ids
+    /// (`t0..t{n-1}`) plus a current index inside it. Unique ids let the
+    /// property track the following track and the surviving tracks by identity.
+    fn arb_nonempty_queue_unique_ids() -> impl Strategy<Value = Queue> {
+        (1usize..32).prop_flat_map(|len| {
+            let tracks: Vec<QueueTrack> = (0..len)
+                .map(|i| QueueTrack {
+                    track_id: format!("t{i}"),
+                    title: format!("Title {i}"),
+                    artist: format!("Artist {i}"),
+                    duration_ms: Some(180_000),
+                })
+                .collect();
+            (Just(tracks), 0..len).prop_map(|(tracks, current)| Queue {
+                tracks,
+                current: Some(current),
+                pre_shuffle_order: None,
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 17: Removing the current track advances the pointer
+        // Validates: Requirements 5.11
+        //
+        // For any Queue with a current track, removing the current track moves
+        // the pointer to the track that followed it, or to no track when the
+        // removed track was last. We capture the removed track's identity, the
+        // following track's identity (if any), and the surviving ids before the
+        // operation, then assert the outcome, the new pointer, and that exactly
+        // the removed track is gone while the rest keep their relative order.
+        #[test]
+        fn remove_current_advances_pointer(queue in arb_nonempty_queue_unique_ids()) {
+            let ids = |q: &Queue| -> Vec<String> {
+                q.tracks.iter().map(|t| t.track_id.clone()).collect()
+            };
+            let current_id = |q: &Queue| -> Option<String> {
+                q.current.map(|i| q.tracks[i].track_id.clone())
+            };
+
+            let original_ids = ids(&queue);
+            let current = queue.current.expect("strategy yields a current track");
+            let was_last = current + 1 == original_ids.len();
+            let removed_id = original_ids[current].clone();
+            // The track that followed the current one, if the current was not last.
+            let following_id = original_ids.get(current + 1).cloned();
+            // Every track except the removed one, in original relative order.
+            let survivors: Vec<String> = original_ids
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != current)
+                .map(|(_, id)| id.clone())
+                .collect();
+
+            let mut q = queue.clone();
+            let outcome = q
+                .remove_current()
+                .expect("a queue with a current track removes it");
+
+            // The removed track is gone and every other track keeps its order.
+            prop_assert_eq!(ids(&q), survivors.clone());
+
+            if was_last {
+                if survivors.is_empty() {
+                    // The removed track was the only track: the queue empties and
+                    // the pointer clears (points at no track).
+                    prop_assert_eq!(outcome, RemoveCurrentOutcome::Emptied);
+                    prop_assert!(q.is_empty());
+                    prop_assert_eq!(q.current, None);
+                } else {
+                    // The removed track was last among several: no following
+                    // track existed, so the pointer rests on the new final track.
+                    let new_current = q.tracks.len() - 1;
+                    prop_assert_eq!(outcome, RemoveCurrentOutcome::Advanced { new_current });
+                    prop_assert_eq!(q.current, Some(new_current));
+                    prop_assert_eq!(current_id(&q), survivors.last().cloned());
+                }
+            } else {
+                // A following track existed: the pointer advances to it, keeping
+                // the same index the follower now occupies (`current`).
+                prop_assert_eq!(outcome, RemoveCurrentOutcome::Advanced { new_current: current });
+                prop_assert_eq!(q.current, Some(current));
+                prop_assert_eq!(current_id(&q), following_id);
+            }
+
+            // The removed id never lingers in the queue.
+            prop_assert!(!ids(&q).contains(&removed_id));
+        }
+    }
+}
+
+#[cfg(test)]
+mod queue_invariant_stateful_property_tests {
+    //! Stateful property-based test for the Queue invariant (task 5.12). Runs a
+    //! randomly generated sequence of add / remove / reorder / shuffle
+    //! operations against a real `Queue` and checks the invariant after every
+    //! step, at >=100 iterations, in a uniquely-named module so it does not
+    //! collide with the other `property_tests` / `*_property_tests` modules.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The structural operations the state machine can apply to the Queue. The
+    /// embedded selectors (`usize` / `f64` fractions) are resolved against the
+    /// live Queue length when the step runs, so every generated op is valid to
+    /// attempt even as the Queue grows and shrinks across the sequence.
+    #[derive(Debug, Clone)]
+    enum Op {
+        /// Insert a fresh track immediately after the current track.
+        PlayNext,
+        /// Append a fresh track after the last track.
+        AddToQueue,
+        /// Remove a non-current track chosen by a fraction of the length.
+        RemoveNonCurrent(f64),
+        /// Remove the current track.
+        RemoveCurrent,
+        /// Move a track (chosen by fraction) to a target position (chosen by
+        /// fraction over a slightly widened range so clamping is exercised).
+        Move(f64, f64),
+        /// Enable shuffle (real clock-seeded permutation).
+        Shuffle,
+        /// Disable shuffle, restoring the pre-shuffle order.
+        Unshuffle,
+    }
+
+    /// Strategy over a single operation. Each variant is weighted so adds are
+    /// common enough to let the Queue grow before removals shrink it.
+    fn arb_op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            3 => Just(Op::PlayNext),
+            3 => Just(Op::AddToQueue),
+            2 => (0.0f64..1.0).prop_map(Op::RemoveNonCurrent),
+            1 => Just(Op::RemoveCurrent),
+            2 => (0.0f64..1.0, 0.0f64..1.0).prop_map(|(a, b)| Op::Move(a, b)),
+            1 => Just(Op::Shuffle),
+            1 => Just(Op::Unshuffle),
+        ]
+    }
+
+    /// The Queue invariant from Requirement 5.9: the current-track pointer names
+    /// a track that exists in the Queue, or names no track exactly when the
+    /// Queue is empty.
+    fn pointer_invariant_holds(q: &Queue) -> bool {
+        match q.current {
+            None => q.tracks.is_empty(),
+            Some(i) => !q.tracks.is_empty() && i < q.tracks.len(),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 16: Queue invariant across operation sequences
+        // Validates: Requirements 5.9
+        //
+        // For any sequence of add, remove, reorder, and shuffle operations,
+        // after each operation the current-track pointer references a track that
+        // exists in the Queue (or references no track exactly when the Queue is
+        // empty), and the Queue length equals the starting length plus the
+        // number of added tracks minus the number of removed tracks.
+        //
+        // The test is state-machine style: it seeds a Queue of 0..=8 tracks,
+        // then applies a generated sequence of up to 40 operations one at a
+        // time. Each step resolves its selectors against the live Queue, applies
+        // the real `Queue` method, and counts a track as added only when an add
+        // actually grew the Queue and as removed only when a remove actually
+        // shrank it (rejected adds at the limit, out-of-range removes, and
+        // current-track removes via `remove` are no-ops and are not counted).
+        // After every step both the pointer invariant and the
+        // length == start + added - removed accounting must hold; reorder and
+        // shuffle move tracks around without changing the count.
+        #[test]
+        fn queue_invariant_across_operation_sequences(
+            start_len in 0usize..=8,
+            start_ptr in 0.0f64..1.0,
+            ops in proptest::collection::vec(arb_op(), 0..40),
+        ) {
+            // Seed a Queue with unique ids so track identity is unambiguous.
+            let mut q = Queue::new();
+            for i in 0..start_len {
+                let id = format!("s{i}");
+                q.add_to_queue(QueueTrack {
+                    track_id: id.clone(),
+                    title: format!("Title {id}"),
+                    artist: format!("Artist {id}"),
+                    duration_ms: Some(180_000),
+                })
+                .unwrap();
+            }
+            // `add_to_queue` on an empty queue sets current to 0; move it to an
+            // arbitrary in-range position so the sequence starts from a varied
+            // pointer. (No-op when the queue is empty.)
+            if start_len > 0 {
+                q.current = Some(((start_ptr * start_len as f64) as usize).min(start_len - 1));
+            }
+
+            let starting_len = start_len;
+            let mut added: usize = 0;
+            let mut removed: usize = 0;
+            // Counter for fresh, collision-free ids on every add.
+            let mut next_id: usize = 0;
+
+            // The invariant must already hold on the seeded Queue.
+            prop_assert!(pointer_invariant_holds(&q), "seed violates pointer invariant: {:?}", q);
+            prop_assert_eq!(q.len(), starting_len);
+
+            for op in ops {
+                let len_before = q.len();
+
+                match op {
+                    Op::PlayNext => {
+                        let id = format!("add{next_id}");
+                        next_id += 1;
+                        let res = q.play_next(QueueTrack {
+                            track_id: id.clone(),
+                            title: id.clone(),
+                            artist: id.clone(),
+                            duration_ms: None,
+                        });
+                        // Count the add only when it actually grew the Queue.
+                        if res.is_ok() {
+                            added += 1;
+                            prop_assert_eq!(q.len(), len_before + 1);
+                        } else {
+                            // Rejected at the limit: Queue unchanged.
+                            prop_assert_eq!(q.len(), len_before);
+                        }
+                    }
+                    Op::AddToQueue => {
+                        let id = format!("add{next_id}");
+                        next_id += 1;
+                        let res = q.add_to_queue(QueueTrack {
+                            track_id: id.clone(),
+                            title: id.clone(),
+                            artist: id.clone(),
+                            duration_ms: None,
+                        });
+                        if res.is_ok() {
+                            added += 1;
+                            prop_assert_eq!(q.len(), len_before + 1);
+                        } else {
+                            prop_assert_eq!(q.len(), len_before);
+                        }
+                    }
+                    Op::RemoveNonCurrent(frac) => {
+                        if len_before == 0 {
+                            // Nothing to remove.
+                            prop_assert_eq!(q.len(), 0);
+                        } else {
+                            let index = ((frac * len_before as f64) as usize).min(len_before - 1);
+                            let did_remove = q.remove(index);
+                            if did_remove {
+                                removed += 1;
+                                prop_assert_eq!(q.len(), len_before - 1);
+                            } else {
+                                // Current-track index (rejected by `remove`): no change.
+                                prop_assert_eq!(q.len(), len_before);
+                            }
+                        }
+                    }
+                    Op::RemoveCurrent => {
+                        match q.remove_current() {
+                            Some(_) => {
+                                removed += 1;
+                                prop_assert_eq!(q.len(), len_before - 1);
+                            }
+                            None => {
+                                // Empty queue: no current track to remove.
+                                prop_assert_eq!(q.len(), len_before);
+                            }
+                        }
+                    }
+                    Op::Move(from_frac, target_frac) => {
+                        if len_before == 0 {
+                            prop_assert_eq!(q.len(), 0);
+                        } else {
+                            let from = ((from_frac * len_before as f64) as usize)
+                                .min(len_before - 1);
+                            // Widen the target range so below-range (0) and
+                            // above-range (>len) targets exercise clamping.
+                            let target = (target_frac * (len_before as f64 + 3.0)) as usize;
+                            q.move_track(from, target);
+                            // Reorder never changes the count.
+                            prop_assert_eq!(q.len(), len_before);
+                        }
+                    }
+                    Op::Shuffle => {
+                        q.shuffle();
+                        prop_assert_eq!(q.len(), len_before);
+                    }
+                    Op::Unshuffle => {
+                        q.unshuffle();
+                        prop_assert_eq!(q.len(), len_before);
+                    }
+                }
+
+                // After every operation the pointer invariant holds.
+                prop_assert!(
+                    pointer_invariant_holds(&q),
+                    "pointer invariant violated after {:?}: {:?}",
+                    op,
+                    q
+                );
+
+                // And the length accounting holds: start + added - removed.
+                let expected_len = starting_len + added - removed;
+                prop_assert_eq!(q.len(), expected_len);
+            }
+        }
     }
 }

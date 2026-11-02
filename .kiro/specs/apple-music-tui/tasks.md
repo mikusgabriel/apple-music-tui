@@ -34,7 +34,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Format non-negative durations as `m:ss` under 1 hour and `h:mm:ss` for 1 hour or more, with zero-padding
     - Provide an inverse parse of the formatted string back to whole seconds
     - _Requirements: 3.4, 6.5_
-  - [ ]* 2.2 Write property test for duration formatting
+  - [x] 2.2 Write property test for duration formatting
     - **Property 5: Duration formatting**
     - **Validates: Requirements 3.4, 6.5**
   - [x] 2.3 Implement Now_Playing_Bar field rendering and responsive truncation
@@ -42,7 +42,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Truncate album, then artist, then title with a single ellipsis while keeping elapsed/duration/status visible
     - _Requirements: 6.1, 6.3, 6.4, 6.7_
     - _Design: Now_Playing_Bar_
-  - [ ]* 2.4 Write property test for Now_Playing_Bar truncation
+  - [x] 2.4 Write property test for Now_Playing_Bar truncation
     - **Property 18: Now_Playing_Bar truncation under narrow width**
     - **Validates: Requirements 6.4**
 
@@ -58,16 +58,16 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Create the Config_File and parent directories with default content when absent; warn and continue on write failure
     - _Requirements: 8.2, 8.4, 8.7_
     - _Design: Config_Parser / Config_Printer_
-  - [ ]* 3.3 Write property test for Config validation
+  - [x] 3.3 Write property test for Config validation
     - **Property 19: Config validation**
     - **Validates: Requirements 8.3**
-  - [ ]* 3.4 Write property test for Config print/parse round-trip
+  - [x] 3.4 Write property test for Config print/parse round-trip
     - **Property 20: Config print then parse round-trip**
     - **Validates: Requirements 8.5**
-  - [ ]* 3.5 Write property test for Config defaults on absent settings
+  - [x] 3.5 Write property test for Config defaults on absent settings
     - **Property 21: Config applies defaults for absent settings**
     - **Validates: Requirements 8.6**
-  - [ ]* 3.6 Write unit test for exact default-config content
+  - [x] 3.6 Write unit test for exact default-config content
     - Assert the concrete default TOML produced when the file is absent
     - _Requirements: 8.2_
 
@@ -84,13 +84,13 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Prune Queue tracks unavailable from the API, keep relative order, advance pointer, warn with the removed count
     - _Requirements: 9.4, 9.5, 9.6, 9.7_
     - _Design: Session_State store_
-  - [ ]* 4.3 Write property test for Session_State round-trip
+  - [x] 4.3 Write property test for Session_State round-trip
     - **Property 22: Session_State serialize then deserialize round-trip**
     - **Validates: Requirements 9.3**
-  - [ ]* 4.4 Write property test for corrupt/out-of-range session fallback
+  - [x] 4.4 Write property test for corrupt/out-of-range session fallback
     - **Property 23: Corrupt or out-of-range session falls back to defaults**
     - **Validates: Requirements 9.6**
-  - [ ]* 4.5 Write property test for pruning unavailable tracks on restore
+  - [x] 4.5 Write property test for pruning unavailable tracks on restore
     - **Property 24: Pruning unavailable tracks on restore**
     - **Validates: Requirements 9.7**
 
@@ -112,37 +112,37 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Previous restarts current within 3 seconds or at list start; next/finish wrap under repeat all and stop paused at the last track when off
     - _Requirements: 4.3, 4.4, 4.5, 4.8_
     - _Design: Playback-Start Sequence, IPC Protocol_
-  - [ ]* 5.4 Write property test for play-next insertion
+  - [x] 5.4 Write property test for play-next insertion
     - **Property 9: Play-next inserts after the current track**
     - **Validates: Requirements 5.2**
-  - [ ]* 5.5 Write property test for add-to-queue append
+  - [x] 5.5 Write property test for add-to-queue append
     - **Property 10: Add-to-queue appends**
     - **Validates: Requirements 5.3**
-  - [ ]* 5.6 Write property test for removing a non-current track
+  - [x] 5.6 Write property test for removing a non-current track
     - **Property 11: Removing a non-current track preserves order and pointer**
     - **Validates: Requirements 5.4**
-  - [ ]* 5.7 Write property test for move clamping
+  - [x] 5.7 Write property test for move clamping
     - **Property 12: Move clamps target and preserves other tracks**
     - **Validates: Requirements 5.5**
-  - [ ]* 5.8 Write property test for shuffle prefix/suffix
+  - [x] 5.8 Write property test for shuffle prefix/suffix
     - **Property 13: Shuffle fixes the prefix and permutes the suffix**
     - **Validates: Requirements 5.6**
-  - [ ]* 5.9 Write property test for shuffle/un-shuffle round-trip
+  - [x] 5.9 Write property test for shuffle/un-shuffle round-trip
     - **Property 14: Shuffle then un-shuffle round-trip**
     - **Validates: Requirements 5.7**
-  - [ ]* 5.10 Write property test for repeat cycling
+  - [x] 5.10 Write property test for repeat cycling
     - **Property 15: Repeat mode cycling**
     - **Validates: Requirements 5.8**
-  - [ ]* 5.11 Write property test for removing the current track
+  - [x] 5.11 Write property test for removing the current track
     - **Property 17: Removing the current track advances the pointer**
     - **Validates: Requirements 5.11**
-  - [ ]* 5.12 Write stateful property test for the Queue invariant
+  - [x] 5.12 Write stateful property test for the Queue invariant
     - **Property 16: Queue invariant across operation sequences** (proptest state-machine style over add/remove/reorder/shuffle sequences)
     - **Validates: Requirements 5.9**
-  - [ ]* 5.13 Write property test for transport transitions
+  - [x] 5.13 Write property test for transport transitions
     - **Property 8: Transport transitions over repeat modes**
     - **Validates: Requirements 4.3, 4.4, 4.5, 4.8**
-  - [ ]* 5.14 Write unit test for the 10,000-track boundary
+  - [x] 5.14 Write unit test for the 10,000-track boundary
     - Queue at exactly 10,000 tracks rejects further adds with state unchanged
     - _Requirements: 5.12_
 
@@ -154,10 +154,10 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Clamp seek to 0..duration and treat a forward seek reaching the duration as the track finishing
     - Clamp requested volume to 0..100
     - _Requirements: 4.6, 4.7_
-  - [ ]* 7.2 Write property test for seek clamping
+  - [x] 7.2 Write property test for seek clamping
     - **Property 6: Seek clamping**
     - **Validates: Requirements 4.6**
-  - [ ]* 7.3 Write property test for volume clamping
+  - [x] 7.3 Write property test for volume clamping
     - **Property 7: Volume clamping**
     - **Validates: Requirements 4.7**
   - [x] 7.4 Implement Domain_Object mapping from API responses
@@ -165,10 +165,10 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Substitute empty string for missing text and no value for missing duration; drop resources missing id or name and log them
     - _Requirements: 12.1, 12.2, 12.3_
     - _Design: API_Client, Domain_Object_
-  - [ ]* 7.5 Write property test for mapping preserving present attributes
+  - [x] 7.5 Write property test for mapping preserving present attributes
     - **Property 25: Domain_Object mapping preserves present attributes**
     - **Validates: Requirements 12.1, 12.2**
-  - [ ]* 7.6 Write property test for dropping malformed resources
+  - [x] 7.6 Write property test for dropping malformed resources
     - **Property 26: Malformed resources are dropped, the rest returned**
     - **Validates: Requirements 12.3**
 
@@ -192,7 +192,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Delete the Music_User_Token on sign-out while keeping the cached Developer_Token
     - _Requirements: 1.6, 1.9, 1.11, 1.12, 3.9_
     - _Design: Auth_Manager_
-  - [ ]* 8.4 Write property test for Developer_Token validity decision
+  - [x] 8.4 Write property test for Developer_Token validity decision
     - **Property 1: Developer_Token validity decision**
     - **Validates: Requirements 1.8**
 
@@ -216,7 +216,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Enforce the 10-second timeout with retry; back off on 429 per Retry-After (default 1s, cap 60s, max 3 attempts); show status/request for 5xx and other 4xx; resend once per retry selection
     - _Requirements: 2.5, 12.4, 12.5, 12.6, 12.7, 12.8_
     - _Design: API_Client, Error Handling_
-  - [ ]* 9.5 Write property test for rate-limit backoff schedule
+  - [x] 9.5 Write property test for rate-limit backoff schedule
     - **Property 27: Rate-limit backoff schedule**
     - **Validates: Requirements 12.6**
 
@@ -233,7 +233,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Accept the socket connection, decode framed JSON-RPC requests, dispatch to player/sign-in handlers, and emit notifications
     - _Requirements: 4.2_
     - _Design: Playback_Engine, IPC Protocol_
-  - [ ]* 11.3 Write integration test for IPC protocol conformance
+  - [x] 11.3 Write integration test for IPC protocol conformance
     - Verify request/notification schema between the Rust client and a stub Playback_Engine
     - _Requirements: 4.2_
     - _Design: Testing Strategy (Integration and Smoke Tests)_
@@ -253,7 +253,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Detect loss of the parent TUI process and terminate the engine and its child processes within 5 seconds
     - _Requirements: 10.7_
     - _Design: Playback_Engine, Error Handling_
-  - [ ]* 12.4 Write integration/smoke tests for playback and sign-in orchestration
+  - [x] 12.4 Write integration/smoke tests for playback and sign-in orchestration
     - Playback start latency, stream/DRM failure handling, and engine restart/reconnect at last position (mock MusicKit where possible)
     - Sign_In_Window open/cancel/complete and token capture (mock the Apple-hosted page)
     - _Requirements: 4.1, 4.10, 4.13, 4.14, 1.1, 1.2, 1.3, 1.4, 1.14_
@@ -276,7 +276,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Drive the Now_Playing_Bar from Playback_State so elapsed time updates at least once per second and field changes show within 100ms; keep playback across view switches
     - _Requirements: 5.1, 5.10, 6.2, 6.6, 4.9_
     - _Design: Now_Playing_Bar, TUI (view + input loop)_
-  - [ ]* 13.4 Write unit tests for empty-state and zero-result messages
+  - [x] 13.4 Write unit tests for empty-state and zero-result messages
     - Assert the specific messages for zero search results, empty library sections, and empty Queue
     - _Requirements: 2.4, 3.8, 5.10_
 
@@ -290,7 +290,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Display active view bindings and global bindings with action names and custom bindings; scroll with list-navigation keys; close and restore the prior view on Esc/`?`
     - _Requirements: 7.3_
     - _Design: Keybinding Resolver_
-  - [ ]* 14.3 Write unit tests for keybinding warnings and help overlay
+  - [x] 14.3 Write unit tests for keybinding warnings and help overlay
     - Conflict and unknown-action/unknown-key warnings from config fixtures; help overlay contents for a representative view
     - _Requirements: 7.5, 7.8, 7.3_
 
@@ -301,7 +301,7 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Degrade gracefully when D-Bus is unavailable, logging a warning and continuing non-MPRIS functions without retry
     - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7_
     - _Design: MPRIS_Adapter_
-  - [ ]* 15.2 Write integration tests for MPRIS against a session D-Bus
+  - [x] 15.2 Write integration tests for MPRIS against a session D-Bus
     - Registration, command forwarding, metadata publishing, and bus-name release
     - _Requirements: 11.1, 11.2, 11.3, 11.7_
     - _Design: Testing Strategy (Integration and Smoke Tests)_
@@ -317,12 +317,12 @@ Property-based tests (`proptest`) implement the 27 correctness properties from t
     - Surface the engine start-failure/lost-connection error with a restart action keeping Queue and current track; load current track at last position paused on reconnect
     - _Requirements: 4.10, 4.14_
     - _Design: Technology Stack (preview-only decision), Error Handling_
-  - [ ]* 16.3 Write integration/smoke tests for token fetch, resize, and offline input latency
+  - [x] 16.3 Write integration/smoke tests for token fetch, resize, and offline input latency
     - Developer_Token fetch from live web-player assets and the 401/403 refresh-and-resend flow against a mock API; Token_Store 0600/keyring permissions smoke check
     - Terminal resize redraw and input latency under an unreachable network
     - _Requirements: 1.7, 1.9, 1.5, 12.9, 12.10_
     - _Design: Testing Strategy (Integration and Smoke Tests)_
-  - [ ]* 16.4 Write resource-footprint profiling tests
+  - [x] 16.4 Write resource-footprint profiling tests
     - Measure idle/playback memory and CPU budgets and process-teardown guarantees as a periodic profiling job
     - _Requirements: 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8_
     - _Design: Testing Strategy (Integration and Smoke Tests)_

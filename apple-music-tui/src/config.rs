@@ -787,6 +787,22 @@ mod tests {
     }
 
     #[test]
+    fn printed_default_is_exact_toml_content() {
+        // The concrete default file written when the Config_File is absent
+        // (Requirement 8.2): the four default settings in print order, each on
+        // its own line, with no keybindings table. This pins the exact bytes so
+        // a change to the default content is caught deliberately.
+        let printed = print_config(&Configuration::default());
+        let expected = "\
+storefront = \"us\"
+seek_step_seconds = 10
+mpris_enabled = false
+token_store_backend = \"File\"
+";
+        assert_eq!(printed, expected);
+    }
+
+    #[test]
     fn print_parse_round_trips_all_settings_including_keybindings() {
         let mut config = Configuration {
             storefront: "GB".to_string(),
@@ -940,5 +956,398 @@ mod tests {
         assert!(!path.exists(), "no config file should have been left behind");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Property-based test for Config validation (Property 19) ---
+
+    use proptest::prelude::*;
+
+    /// One top-level setting rendered as a single TOML line, carrying whether
+    /// the value we chose is valid for that setting. The generators below pick
+    /// from both the valid and invalid value spaces for each setting so the
+    /// property exercises the full accept/reject boundary.
+    #[derive(Debug, Clone)]
+    struct SettingLine {
+        /// The exact `key = value` text written on its own line.
+        text: String,
+        /// The top-level setting name the parser should attribute an error to.
+        setting: &'static str,
+        /// Whether the value is valid for this setting (correct type and range).
+        valid: bool,
+    }
+
+    /// Generate a `storefront = <value>` line, valid or invalid.
+    fn storefront_line() -> impl Strategy<Value = SettingLine> {
+        prop_oneof![
+            // Valid: a real ISO 3166-1 alpha-2 code (any case).
+            (proptest::sample::select(ISO_3166_1_ALPHA2), any::<bool>()).prop_map(
+                |(code, lower)| {
+                    let code = if lower { code.to_ascii_lowercase() } else { code.to_string() };
+                    SettingLine {
+                        text: format!("storefront = \"{code}\""),
+                        setting: "storefront",
+                        valid: true,
+                    }
+                }
+            ),
+            // Invalid value: a string that is not a valid country code.
+            prop_oneof![
+                Just("zz".to_string()),
+                Just("usa".to_string()),
+                Just("u".to_string()),
+                Just("1a".to_string()),
+                Just("".to_string()),
+            ]
+            .prop_map(|v| SettingLine {
+                text: format!("storefront = \"{v}\""),
+                setting: "storefront",
+                valid: false,
+            }),
+            // Invalid type: a non-string value.
+            Just(SettingLine {
+                text: "storefront = 42".to_string(),
+                setting: "storefront",
+                valid: false,
+            }),
+        ]
+    }
+
+    /// Generate a `seek_step_seconds = <value>` line, valid or invalid.
+    fn seek_step_line() -> impl Strategy<Value = SettingLine> {
+        prop_oneof![
+            // Valid: an integer within the inclusive 1..=300 range.
+            (MIN_SEEK_STEP_SECONDS..=MAX_SEEK_STEP_SECONDS).prop_map(|n| SettingLine {
+                text: format!("seek_step_seconds = {n}"),
+                setting: "seek_step_seconds",
+                valid: true,
+            }),
+            // Invalid: an out-of-range integer (below 1 or above 300).
+            prop_oneof![
+                (i64::from(i32::MIN)..=0i64),
+                ((MAX_SEEK_STEP_SECONDS as i64 + 1)..=i64::from(i32::MAX)),
+            ]
+            .prop_map(|n| SettingLine {
+                text: format!("seek_step_seconds = {n}"),
+                setting: "seek_step_seconds",
+                valid: false,
+            }),
+            // Invalid type: a non-integer value.
+            Just(SettingLine {
+                text: "seek_step_seconds = \"ten\"".to_string(),
+                setting: "seek_step_seconds",
+                valid: false,
+            }),
+        ]
+    }
+
+    /// Generate an `mpris_enabled = <value>` line, valid or invalid.
+    fn mpris_line() -> impl Strategy<Value = SettingLine> {
+        prop_oneof![
+            any::<bool>().prop_map(|b| SettingLine {
+                text: format!("mpris_enabled = {b}"),
+                setting: "mpris_enabled",
+                valid: true,
+            }),
+            // Invalid type: not a boolean.
+            Just(SettingLine {
+                text: "mpris_enabled = \"yes\"".to_string(),
+                setting: "mpris_enabled",
+                valid: false,
+            }),
+        ]
+    }
+
+    /// Generate a `token_store_backend = <value>` line, valid or invalid.
+    fn backend_line() -> impl Strategy<Value = SettingLine> {
+        prop_oneof![
+            // Valid: an accepted backend name, any case.
+            proptest::sample::select(vec!["File", "Keyring", "file", "keyring", "FILE"])
+                .prop_map(|v| SettingLine {
+                    text: format!("token_store_backend = \"{v}\""),
+                    setting: "token_store_backend",
+                    valid: true,
+                }),
+            // Invalid value: an unrecognized backend name.
+            prop_oneof![Just("vault"), Just("none"), Just("db")].prop_map(|v| SettingLine {
+                text: format!("token_store_backend = \"{v}\""),
+                setting: "token_store_backend",
+                valid: false,
+            }),
+            // Invalid type: not a string.
+            Just(SettingLine {
+                text: "token_store_backend = true".to_string(),
+                setting: "token_store_backend",
+                valid: false,
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 19: Config validation
+        //
+        // Validates: Requirements 8.3
+        //
+        // For any Config_File content, the Config_Parser succeeds if and only
+        // if every present setting has a valid type and value (including a
+        // Storefront that is a valid ISO 3166-1 alpha-2 code); otherwise it
+        // returns an error naming the offending setting and 1-based line
+        // number.
+        #[test]
+        fn property_config_validation(
+            // Each of the four settings is independently either present (with a
+            // valid-or-invalid value) or absent. Building from per-setting
+            // optionals guarantees distinct top-level keys, so the assembled
+            // TOML is always syntactically well-formed and any error is a
+            // type/value error tied to a setting (the subject of Property 19),
+            // never a duplicate-key syntax error.
+            storefront in proptest::option::of(storefront_line()),
+            seek_step in proptest::option::of(seek_step_line()),
+            mpris in proptest::option::of(mpris_line()),
+            backend in proptest::option::of(backend_line()),
+        ) {
+            let lines: Vec<SettingLine> =
+                [storefront, seek_step, mpris, backend].into_iter().flatten().collect();
+
+            // Assemble the generated settings into a Config_File, one per line,
+            // remembering each setting's 1-based line number and validity.
+            let mut text = String::new();
+            let mut per_line: Vec<SettingLine> = Vec::new();
+            for line in &lines {
+                text.push_str(&line.text);
+                text.push('\n');
+                per_line.push(line.clone());
+            }
+
+            let result = parse_config(&text);
+            let all_valid = per_line.iter().all(|l| l.valid);
+
+            if all_valid {
+                // iff direction 1: every present setting is valid -> success.
+                prop_assert!(
+                    result.is_ok(),
+                    "expected success for all-valid config:\n{text}\n got {result:?}"
+                );
+            } else {
+                // iff direction 2: some present setting is invalid -> error.
+                let err = match result {
+                    Err(e) => e,
+                    Ok(ok) => {
+                        return Err(TestCaseError::fail(format!(
+                            "expected an error for config with an invalid setting:\n{text}\n got {ok:?}"
+                        )));
+                    }
+                };
+
+                // The error must name an offending setting (type/value errors
+                // are always tied to a setting here; the generated TOML is
+                // always syntactically valid).
+                let named = err.setting.as_deref().expect("value error names a setting");
+
+                // The named setting must be one of the invalid ones we wrote.
+                let invalid_settings: Vec<&str> =
+                    per_line.iter().filter(|l| !l.valid).map(|l| l.setting).collect();
+                prop_assert!(
+                    invalid_settings.contains(&named),
+                    "error named `{named}` but invalid settings were {invalid_settings:?}\n{text}"
+                );
+
+                // The 1-based line number must be within the file and point at
+                // a line whose setting matches the one named in the error.
+                prop_assert!(err.line >= 1 && err.line <= per_line.len(),
+                    "line {} out of range 1..={}\n{text}", err.line, per_line.len());
+                let line_setting = per_line[err.line - 1].setting;
+                prop_assert_eq!(
+                    line_setting, named,
+                    "error line {} holds `{}` but error named `{}`\n{}",
+                    err.line, line_setting, named, text
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    //! Property-based tests for the Configuration subsystem, each exercising a
+    //! single design correctness property at >=100 iterations.
+    use super::*;
+    use proptest::collection::btree_map;
+    use proptest::prelude::*;
+
+    /// Generate a valid ISO 3166-1 alpha-2 storefront code by indexing into the
+    /// officially assigned set the parser validates against, mixing in random
+    /// case so the printer's verbatim output and the case-insensitive parser
+    /// both round-trip (Requirement 8.5).
+    fn valid_storefront() -> impl Strategy<Value = String> {
+        (0..ISO_3166_1_ALPHA2.len(), any::<bool>()).prop_map(|(i, lower)| {
+            let code = ISO_3166_1_ALPHA2[i];
+            if lower {
+                code.to_ascii_lowercase()
+            } else {
+                code.to_string()
+            }
+        })
+    }
+
+    /// Generate an arbitrary valid [`Configuration`]: a valid storefront, a seek
+    /// step in `1..=300`, arbitrary MPRIS/backend flags, and arbitrary
+    /// keybindings (arbitrary action names and key sequences).
+    fn arbitrary_configuration() -> impl Strategy<Value = Configuration> {
+        (
+            valid_storefront(),
+            MIN_SEEK_STEP_SECONDS..=MAX_SEEK_STEP_SECONDS,
+            any::<bool>(),
+            prop_oneof![
+                Just(TokenStoreBackend::File),
+                Just(TokenStoreBackend::Keyring),
+            ],
+            btree_map(".*", ".*", 0..8),
+        )
+            .prop_map(
+                |(storefront, seek_step_seconds, mpris_enabled, token_store_backend, keybindings)| {
+                    Configuration {
+                        storefront,
+                        seek_step_seconds,
+                        mpris_enabled,
+                        token_store_backend,
+                        keybindings,
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 20: Config print then parse round-trip
+        // Validates: Requirements 8.5
+        //
+        // For any valid Configuration, parsing the Config_Printer output yields a
+        // Configuration equal to the original in every setting, including every
+        // keybinding. Storefront comparison is case-insensitive because the
+        // printer emits the code verbatim and the parser accepts it as given.
+        #[test]
+        fn property_config_print_parse_round_trip(config in arbitrary_configuration()) {
+            let printed = print_config(&config);
+            let (restored, warnings) =
+                parse_config(&printed).expect("printed config must parse");
+
+            // No setting of a valid Configuration is unknown, so there are no
+            // warnings on a round-trip.
+            prop_assert!(warnings.is_empty());
+
+            // The storefront is preserved exactly as printed (the parser keeps
+            // the given casing), so equality is byte-for-byte here.
+            prop_assert_eq!(&restored.storefront, &config.storefront);
+            prop_assert_eq!(restored.seek_step_seconds, config.seek_step_seconds);
+            prop_assert_eq!(restored.mpris_enabled, config.mpris_enabled);
+            prop_assert_eq!(restored.token_store_backend, config.token_store_backend);
+            prop_assert_eq!(&restored.keybindings, &config.keybindings);
+
+            // And the whole Configuration is equal in every setting.
+            prop_assert_eq!(restored, config);
+        }
+    }
+
+    /// Render a single top-level scalar setting to the TOML line
+    /// [`parse_config`] accepts, matching the forms [`print_config`] emits.
+    fn render_setting(config: &Configuration, setting: &str) -> String {
+        match setting {
+            "storefront" => format!("storefront = \"{}\"\n", config.storefront),
+            "seek_step_seconds" => format!("seek_step_seconds = {}\n", config.seek_step_seconds),
+            "mpris_enabled" => format!("mpris_enabled = {}\n", config.mpris_enabled),
+            "token_store_backend" => format!(
+                "token_store_backend = \"{}\"\n",
+                match config.token_store_backend {
+                    TokenStoreBackend::File => "File",
+                    TokenStoreBackend::Keyring => "Keyring",
+                }
+            ),
+            other => unreachable!("unexpected scalar setting {other}"),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 21: Config applies defaults for absent settings
+        //
+        // Validates: Requirements 8.6
+        //
+        // For any valid Config_File with an arbitrary subset of settings omitted,
+        // the parsed Configuration equals that file's present settings combined
+        // with the default value for each omitted setting, and no defaults are
+        // written back to the file. parse_config is pure over its `&str` input,
+        // so the file text is unchanged after parsing.
+        #[test]
+        fn property_config_applies_defaults_for_absent_settings(
+            full in arbitrary_configuration(),
+            // Independent present/absent choice for each of the four scalar
+            // settings plus the keybindings table, in declaration order.
+            present in prop::collection::vec(any::<bool>(), 5),
+        ) {
+            let scalars = [
+                "storefront",
+                "seek_step_seconds",
+                "mpris_enabled",
+                "token_store_backend",
+            ];
+
+            // Build the Config_File from only the present settings. A valid
+            // storefront code never needs quoting beyond the usual TOML string,
+            // and the keybinding map is generated with arbitrary strings, so emit
+            // the keybindings table via the printer to keep escaping correct.
+            let mut text = String::new();
+            for (setting, &keep) in scalars.iter().zip(present.iter()) {
+                if keep {
+                    text.push_str(&render_setting(&full, setting));
+                }
+            }
+
+            // The keybindings table is the fifth present/absent choice. An empty
+            // table and an absent table both mean "no overrides", so only treat
+            // keybindings as present when kept and non-empty. Reuse the printer's
+            // table rendering (via a keybindings-only Configuration) so arbitrary
+            // action names and key sequences are escaped exactly as the parser
+            // expects.
+            let keybindings_present = present[4] && !full.keybindings.is_empty();
+            if keybindings_present {
+                let only_keys = Configuration {
+                    keybindings: full.keybindings.clone(),
+                    ..Configuration::default()
+                };
+                let printed = print_config(&only_keys);
+                // Keep just the `[keybindings]` table and its entries from the
+                // printed output; the leading scalar defaults are dropped so this
+                // case exercises an absent-scalar + present-table file.
+                if let Some(idx) = printed.find("[keybindings]") {
+                    text.push('\n');
+                    text.push_str(&printed[idx..]);
+                }
+            }
+
+            // Expected: present settings carry `full`'s value; absent settings
+            // take the default.
+            let defaults = Configuration::default();
+            let expected = Configuration {
+                storefront: if present[0] { full.storefront.clone() } else { defaults.storefront.clone() },
+                seek_step_seconds: if present[1] { full.seek_step_seconds } else { defaults.seek_step_seconds },
+                mpris_enabled: if present[2] { full.mpris_enabled } else { defaults.mpris_enabled },
+                token_store_backend: if present[3] { full.token_store_backend } else { defaults.token_store_backend },
+                keybindings: if keybindings_present { full.keybindings.clone() } else { defaults.keybindings.clone() },
+            };
+
+            let original = text.clone();
+            let (parsed, warnings) = parse_config(&text).expect("valid config parses");
+
+            // Present settings keep their value; absent settings take the default.
+            prop_assert_eq!(parsed, expected);
+            // A valid file of known settings yields no unknown-setting warnings.
+            prop_assert!(warnings.is_empty());
+            // Defaults are applied in memory only: the file text is untouched.
+            prop_assert_eq!(text, original);
+        }
     }
 }

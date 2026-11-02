@@ -1587,4 +1587,222 @@ mod tests {
         // A viewport taller than the list shows every entry.
         assert_eq!(overlay.visible(overlay.len() + 5).len(), overlay.len());
     }
+
+    // --- Warning message content (Requirements 7.5, 7.8) ---
+    //
+    // Requirement 7.5 requires the conflict warning to name the conflicting key
+    // and both actions; Requirement 7.8 requires the unknown-action and
+    // unknown-key warnings to name the invalid entry. The tests above assert the
+    // variant and the fall-back bindings; these assert the user-facing message
+    // content carries the required identifying detail.
+
+    /// Pull the single conflict warning out of a resolution, failing loudly if
+    /// there is not exactly one.
+    fn sole_conflict(r: &Resolution) -> &KeybindingWarning {
+        let conflicts: Vec<_> = r
+            .warnings()
+            .iter()
+            .filter(|w| matches!(w, KeybindingWarning::Conflict { .. }))
+            .collect();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "expected exactly one conflict: {:?}",
+            r.warnings()
+        );
+        conflicts[0]
+    }
+
+    #[test]
+    fn conflict_warning_names_key_and_both_actions() {
+        // Two custom actions bound to the same free key `z`: the warning must
+        // name the key and both action names (Requirement 7.5).
+        let config = config_with(&[("quit", "z"), ("help", "z")]);
+        let r = resolve_keybindings(&config);
+        let warning = sole_conflict(&r);
+
+        match warning {
+            KeybindingWarning::Conflict {
+                sequence,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(sequence, "z", "warning names the conflicting key");
+                let names = [first.name(), second.name()];
+                assert!(names.contains(&"quit"), "names quit: {names:?}");
+                assert!(names.contains(&"help"), "names help: {names:?}");
+            }
+            other => panic!("expected a conflict warning, got {other:?}"),
+        }
+
+        // The rendered message also carries the key and both action names so the
+        // startup output is self-describing (Requirement 7.5).
+        let message = warning.to_string();
+        assert!(message.contains('z'), "message names the key: {message}");
+        assert!(message.contains("quit"), "message names quit: {message}");
+        assert!(message.contains("help"), "message names help: {message}");
+    }
+
+    #[test]
+    fn conflict_with_unlisted_default_names_key_and_both_actions() {
+        // Binding quit to `?` collides with help's unlisted default `?`
+        // (Requirement 7.5). The warning still names the key and both actions,
+        // even though help was never listed in the config.
+        let config = config_with(&[("quit", "?")]);
+        let r = resolve_keybindings(&config);
+        let warning = sole_conflict(&r);
+
+        match warning {
+            KeybindingWarning::Conflict {
+                sequence,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(sequence, "?");
+                let names = [first.name(), second.name()];
+                assert!(names.contains(&"quit"), "names quit: {names:?}");
+                assert!(
+                    names.contains(&"help"),
+                    "names the unlisted default owner help: {names:?}"
+                );
+            }
+            other => panic!("expected a conflict warning, got {other:?}"),
+        }
+        // Both named actions fall back to their defaults (Requirement 7.5).
+        assert_eq!(r.sequences_for(Action::Quit), &[seq("q")]);
+        assert!(r.sequences_for(Action::Help).contains(&seq("?")));
+    }
+
+    #[test]
+    fn unknown_action_warning_names_the_invalid_entry() {
+        // Requirement 7.8: the warning names the invalid action entry.
+        let config = config_with(&[("teleport", "t")]);
+        let r = resolve_keybindings(&config);
+        assert_eq!(r.warnings().len(), 1);
+        match &r.warnings()[0] {
+            KeybindingWarning::UnknownAction { name } => assert_eq!(name, "teleport"),
+            other => panic!("expected an unknown-action warning, got {other:?}"),
+        }
+        assert!(
+            r.warnings()[0].to_string().contains("teleport"),
+            "message names the invalid entry: {}",
+            r.warnings()[0]
+        );
+    }
+
+    #[test]
+    fn unknown_key_warning_names_entry_and_falls_back() {
+        // Requirement 7.8: an unrecognized key name warns naming the action and
+        // the offending key, and the action keeps its default binding.
+        let config = config_with(&[("quit", "wiggle")]);
+        let r = resolve_keybindings(&config);
+        assert_eq!(r.warnings().len(), 1);
+        match &r.warnings()[0] {
+            KeybindingWarning::UnknownKey {
+                action,
+                sequence,
+                reason,
+            } => {
+                assert_eq!(action, "quit");
+                assert_eq!(sequence, "wiggle");
+                assert_eq!(*reason, KeyParseError::UnknownKey("wiggle".to_string()));
+            }
+            other => panic!("expected an unknown-key warning, got {other:?}"),
+        }
+        let message = r.warnings()[0].to_string();
+        assert!(message.contains("quit"), "message names the action: {message}");
+        assert!(message.contains("wiggle"), "message names the key: {message}");
+        // Falls back to the default `q` for the affected action (Requirement 7.8).
+        assert_eq!(r.sequences_for(Action::Quit), &[seq("q")]);
+    }
+
+    #[test]
+    fn unknown_action_and_unknown_key_coexist_independently() {
+        // A config fixture mixing both failure modes: each affected action falls
+        // back to its default and each produces its own warning (Requirement
+        // 7.8). Valid entries alongside them are still applied.
+        let config = config_with(&[
+            ("teleport", "t"), // unknown action -> ignored
+            ("help", "nope"),  // unknown key -> help keeps default `?`
+            ("quit", "ctrl+c"), // valid override applied
+        ]);
+        let r = resolve_keybindings(&config);
+
+        let has_unknown_action = r.warnings().iter().any(|w| {
+            matches!(w, KeybindingWarning::UnknownAction { name } if name == "teleport")
+        });
+        let has_unknown_key = r.warnings().iter().any(|w| {
+            matches!(w, KeybindingWarning::UnknownKey { action, .. } if action == "help")
+        });
+        assert!(has_unknown_action, "unknown action warned: {:?}", r.warnings());
+        assert!(has_unknown_key, "unknown key warned: {:?}", r.warnings());
+
+        // help keeps its default, quit takes the valid override.
+        assert!(r.sequences_for(Action::Help).contains(&seq("?")));
+        assert_eq!(r.sequences_for(Action::Quit), &[seq("ctrl+c")]);
+    }
+
+    // --- Help overlay contents for a representative view (Requirement 7.3) ---
+
+    #[test]
+    fn help_overlay_lists_active_view_and_global_bindings_with_action_names() {
+        // The Queue view is a representative non-global view: its overlay must
+        // list the active view's bindings and every global binding, each with
+        // its action name and key sequences, including a custom binding
+        // (Requirement 7.3, 7.4).
+        let config = config_with(&[("add_to_queue", "ctrl+a")]);
+        let r = resolve_keybindings(&config);
+        let overlay = HelpOverlay::open(&r, View::Queue);
+        let entries = overlay.entries();
+
+        // Every entry exposes a non-empty action label and at least one key
+        // sequence (Requirement 7.3: "each with its action name").
+        for entry in entries {
+            assert!(
+                !entry.label().is_empty(),
+                "entry for {:?} has an action label",
+                entry.action()
+            );
+            assert!(
+                !entry.sequences().is_empty(),
+                "entry for {:?} lists at least one key sequence",
+                entry.action()
+            );
+            assert!(
+                !entry.keys_display().is_empty(),
+                "entry for {:?} renders its keys",
+                entry.action()
+            );
+        }
+
+        // A representative active-view binding and a representative global
+        // binding both appear with their display labels.
+        let labels: Vec<&str> = entries.iter().map(HelpEntry::label).collect();
+        assert!(
+            labels.contains(&Action::AddToQueue.display_name()),
+            "active-view action labelled: {labels:?}"
+        );
+        assert!(
+            labels.contains(&Action::Quit.display_name()),
+            "global action labelled: {labels:?}"
+        );
+
+        // The custom binding is shown in the overlay rather than the default
+        // `a` (Requirement 7.4: "show the custom Keybindings in the help
+        // overlay").
+        let add = entries
+            .iter()
+            .find(|e| e.action() == Action::AddToQueue)
+            .expect("add_to_queue entry present");
+        assert_eq!(add.keys_display(), "ctrl+a");
+
+        // A global multi-key action still renders all of its sequences.
+        let nav_down = entries
+            .iter()
+            .find(|e| e.action() == Action::NavDown)
+            .expect("nav_down entry present");
+        assert_eq!(nav_down.keys_display(), "j, down");
+    }
 }

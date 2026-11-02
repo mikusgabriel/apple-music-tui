@@ -1106,4 +1106,399 @@ mod tests {
         assert_eq!(removed, 0);
         assert_eq!(r.state.current_index, None);
     }
+
+    // --- property: corrupt / out-of-range fallback (R9.6) ---
+
+    mod property_tests {
+        use super::super::*;
+        use super::unique_temp_dir;
+        use proptest::prelude::*;
+        use std::fs;
+
+        /// Build a serialized track from a generated id and optional duration.
+        fn make_track(id: u64, duration_ms: Option<u64>) -> SerializedTrack {
+            SerializedTrack {
+                track_id: format!("track-{id}"),
+                title: format!("Title {id}"),
+                artist: format!("Artist {id}"),
+                duration_ms,
+            }
+        }
+
+        /// Serialize a `Session_State` to JSON bytes and write them to a fresh
+        /// session file, returning the path and the bytes on disk. The write
+        /// goes straight to disk (bypassing `save_session_to`, which never
+        /// validates ranges) so out-of-range values survive to the restore.
+        fn seed_json(dir: &std::path::Path, state: &Session_State) -> (std::path::PathBuf, Vec<u8>) {
+            let path = dir.join(SESSION_FILE);
+            let bytes = serde_json::to_vec(state).expect("serialize seed");
+            fs::write(&path, &bytes).expect("write seed");
+            (path, bytes)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            // Feature: apple-music-tui, Property 23: Corrupt or out-of-range session falls back to defaults
+            // Validates: Requirements 9.6
+            //
+            // For any session file that is unreadable/unparseable, or that holds
+            // a current-track pointer outside the Queue bounds or a volume above
+            // the supported maximum, restoring at startup yields an empty Queue
+            // with the default Playback_State, raises a warning, and leaves the
+            // session file byte-for-byte unmodified.
+            #[test]
+            fn property_corrupt_or_out_of_range_falls_back(
+                // Arbitrary bytes that are (almost always) not valid session
+                // JSON. A leading byte that cannot start JSON keeps it
+                // unparseable even if proptest produces otherwise-structured
+                // bytes.
+                garbage in proptest::collection::vec(any::<u8>(), 0..64),
+                // A queue of 0..=8 tracks with arbitrary durations.
+                durations in proptest::collection::vec(
+                    proptest::option::of(0u64..600_000),
+                    0..9usize,
+                ),
+                // A pointer that we force to be out of bounds for the queue.
+                pointer_offset in 0usize..5,
+                position_seconds in 0u64..100_000,
+                // A volume strictly above the supported maximum (0..=100).
+                // The band spans both representable-u8 values (101..=255,
+                // rejected as out-of-range) and values that overflow a u8
+                // (256.., rejected while parsing); either way the restore must
+                // fall back with a warning.
+                over_volume in 101u16..=1000,
+                shuffle in any::<bool>(),
+            ) {
+                // --- Case 1: unparseable bytes ---
+                {
+                    let dir = unique_temp_dir("prop-unparseable");
+                    let path = dir.join(SESSION_FILE);
+                    // Prefix with a byte that cannot begin a JSON document so
+                    // the content is always unparseable as a Session_State.
+                    let mut bytes = vec![b'\x7f'];
+                    bytes.extend_from_slice(&garbage);
+                    fs::write(&path, &bytes).expect("write garbage");
+
+                    let restored = restore_session_from(&path);
+
+                    prop_assert_eq!(&restored.state, &Session_State::default());
+                    prop_assert!(restored.warning.is_some(), "corrupt file must warn");
+                    // The file on disk is left untouched (Requirement 9.6).
+                    prop_assert_eq!(fs::read(&path).expect("file present"), bytes);
+
+                    fs::remove_dir_all(&dir).ok();
+                }
+
+                // --- Case 2: current-track pointer outside the queue bounds ---
+                {
+                    let dir = unique_temp_dir("prop-pointer");
+                    let tracks: Vec<SerializedTrack> = durations
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &d)| make_track(i as u64, d))
+                        .collect();
+                    let len = tracks.len();
+                    // Always point at or past the end of the queue (len..len+5),
+                    // which is outside the valid 0..len bounds.
+                    let bad_pointer = len + pointer_offset;
+                    let state = Session_State {
+                        queue: SerializedQueue { tracks },
+                        current_index: Some(bad_pointer),
+                        position_seconds,
+                        volume: 50,
+                        shuffle,
+                        repeat: RepeatMode::Off,
+                    };
+                    let (path, bytes) = seed_json(&dir, &state);
+
+                    let restored = restore_session_from(&path);
+
+                    prop_assert_eq!(&restored.state, &Session_State::default());
+                    prop_assert!(
+                        matches!(restored.warning, Some(RestoreWarning::OutOfRange(_))),
+                        "an out-of-range pointer must fall back with an out-of-range warning"
+                    );
+                    prop_assert_eq!(fs::read(&path).expect("file present"), bytes);
+
+                    fs::remove_dir_all(&dir).ok();
+                }
+
+                // --- Case 3: volume above the supported maximum ---
+                {
+                    let dir = unique_temp_dir("prop-volume");
+                    let path = dir.join(SESSION_FILE);
+                    // The struct's volume is a u8, so an over-range value can
+                    // only reach restore via crafted JSON text.
+                    let json = format!(
+                        "{{\"queue\":{{\"tracks\":[]}},\"current_index\":null,\
+                         \"position_seconds\":{position_seconds},\"volume\":{over_volume},\
+                         \"shuffle\":{shuffle},\"repeat\":\"Off\"}}"
+                    );
+                    fs::write(&path, &json).expect("write over-volume json");
+
+                    let restored = restore_session_from(&path);
+
+                    prop_assert_eq!(&restored.state, &Session_State::default());
+                    // A volume in 101..=255 is a valid u8 rejected as out of
+                    // range; 256.. overflows the u8 and is rejected while
+                    // parsing. Both are valid fallbacks under Requirement 9.6,
+                    // so only require a warning of the expected kind.
+                    match &restored.warning {
+                        Some(RestoreWarning::OutOfRange(_)) => {
+                            prop_assert!(
+                                over_volume <= u16::from(u8::MAX),
+                                "out-of-range only applies to representable u8 volumes"
+                            );
+                        }
+                        Some(RestoreWarning::Unparseable(_)) => {
+                            prop_assert!(
+                                over_volume > u16::from(u8::MAX),
+                                "unparseable only applies to volumes that overflow a u8"
+                            );
+                        }
+                        other => prop_assert!(
+                            false,
+                            "an over-range volume must fall back with a warning, got {:?}",
+                            other
+                        ),
+                    }
+                    prop_assert_eq!(fs::read(&path).expect("file present"), json.into_bytes());
+
+                    fs::remove_dir_all(&dir).ok();
+                }
+            }
+        }
+
+        /// Build a `RestoredSession` from a list of track ids and an optional
+        /// current-track pointer, mirroring the unit-test helper so the
+        /// property exercises the same shape of input.
+        fn restored_from_ids(ids: &[u64], current: Option<usize>) -> RestoredSession {
+            RestoredSession {
+                state: Session_State {
+                    queue: SerializedQueue {
+                        tracks: ids.iter().map(|&id| make_track(id, Some(180_000))).collect(),
+                    },
+                    current_index: current,
+                    position_seconds: 0,
+                    volume: 80,
+                    shuffle: false,
+                    repeat: RepeatMode::Off,
+                },
+                warning: None,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            // Feature: apple-music-tui, Property 24: Pruning unavailable tracks on restore
+            // Validates: Requirements 9.7
+            //
+            // For any restored Queue and any subset of its tracks marked
+            // unavailable, the pruned Queue contains exactly the available
+            // tracks in their original relative order and moves the
+            // current-track pointer to the next available track at or after its
+            // old position, or clears it when no available track remains.
+            #[test]
+            fn property_prune_unavailable_keeps_available_in_order(
+                // Distinct track ids (0..count) keep availability lookups
+                // unambiguous; order is the identity of the queue here.
+                count in 0usize..16,
+                // One availability bit per possible track position; only the
+                // first `count` entries are consulted.
+                availability in proptest::collection::vec(any::<bool>(), 16),
+                // A fraction mapped into the queue bounds to pick a valid
+                // current-track pointer (or None when the queue is empty).
+                has_current in any::<bool>(),
+                current_frac in 0.0f64..1.0,
+            ) {
+                let ids: Vec<u64> = (0..count as u64).collect();
+                let current = if count == 0 || !has_current {
+                    None
+                } else {
+                    let idx = (current_frac * count as f64) as usize;
+                    Some(idx.min(count - 1))
+                };
+
+                // `available[id as usize]` decides each track; capture it before
+                // the move so the predicate and the expectations agree.
+                let avail: Vec<bool> = (0..count).map(|i| availability[i]).collect();
+
+                let mut r = restored_from_ids(&ids, current);
+                let removed = r.prune_unavailable(|id| {
+                    let n: u64 = id
+                        .strip_prefix("track-")
+                        .expect("generated id prefix")
+                        .parse()
+                        .expect("generated id number");
+                    avail[n as usize]
+                });
+
+                // Expected survivors: available track ids in their original
+                // relative order.
+                let expected_ids: Vec<u64> = ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| avail[id as usize])
+                    .collect();
+                let actual_ids: Vec<u64> = r
+                    .state
+                    .queue
+                    .tracks
+                    .iter()
+                    .map(|t| {
+                        t.track_id
+                            .strip_prefix("track-")
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap()
+                    })
+                    .collect();
+
+                // Exactly the available tracks, in their original order.
+                prop_assert_eq!(&actual_ids, &expected_ids);
+
+                // The reported count equals how many were dropped.
+                prop_assert_eq!(removed, count - expected_ids.len());
+
+                // The pointer moves to the next available track at or after its
+                // old position, mapped into the pruned queue's indices; it is
+                // cleared when none survive from there (or there was none).
+                let expected_current = current.and_then(|old| {
+                    // First kept index at or after `old` in the original queue.
+                    (old..count).find(|&i| avail[i]).map(|surviving_original| {
+                        // Its new index is the number of survivors strictly
+                        // before it.
+                        (0..surviving_original).filter(|&i| avail[i]).count()
+                    })
+                });
+                prop_assert_eq!(r.state.current_index, expected_current);
+
+                // When the pointer is set, it addresses the expected track id.
+                if let (Some(new_idx), Some(old)) = (r.state.current_index, current) {
+                    let expected_surviving_id =
+                        (old..count).find(|&i| avail[i]).map(|i| ids[i]);
+                    prop_assert_eq!(Some(actual_ids[new_idx]), expected_surviving_id);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod round_trip_property_tests {
+    //! Property-based test for Session_State JSON serialization round-trip
+    //! (task 4.3). Runs the single design correctness property at ≥100
+    //! iterations.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for a single serialized track with arbitrary metadata and an
+    /// optional duration.
+    fn track_strategy() -> impl Strategy<Value = SerializedTrack> {
+        (
+            ".{0,32}",
+            ".{0,64}",
+            ".{0,64}",
+            proptest::option::of(0u64..1_000_000_000),
+        )
+            .prop_map(|(track_id, title, artist, duration_ms)| SerializedTrack {
+                track_id,
+                title,
+                artist,
+                duration_ms,
+            })
+    }
+
+    /// Strategy for a `RepeatMode` across all three variants.
+    fn repeat_strategy() -> impl Strategy<Value = RepeatMode> {
+        prop_oneof![
+            Just(RepeatMode::Off),
+            Just(RepeatMode::RepeatAll),
+            Just(RepeatMode::RepeatOne),
+        ]
+    }
+
+    /// Strategy for an arbitrary valid `Session_State`.
+    ///
+    /// The current-track pointer is generated as a fraction and mapped into the
+    /// queue's bounds so it always refers to a real track (or `None` when the
+    /// queue is empty), matching the input space of a persisted session. The
+    /// volume stays within the supported 0..=100 range and the position is a
+    /// whole number of seconds, as it is persisted to the nearest second.
+    fn session_state_strategy() -> impl Strategy<Value = Session_State> {
+        (
+            prop::collection::vec(track_strategy(), 0..8),
+            any::<bool>(),
+            0.0f64..=1.0,
+            0u64..=1_000_000,
+            0u8..=100,
+            any::<bool>(),
+            repeat_strategy(),
+        )
+            .prop_map(
+                |(tracks, has_current, current_frac, position_seconds, volume, shuffle, repeat)| {
+                    let current_index = if tracks.is_empty() || !has_current {
+                        None
+                    } else {
+                        let idx = (current_frac * tracks.len() as f64) as usize;
+                        Some(idx.min(tracks.len() - 1))
+                    };
+                    Session_State {
+                        queue: SerializedQueue { tracks },
+                        current_index,
+                        position_seconds,
+                        volume,
+                        shuffle,
+                        repeat,
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 22: Session_State serialize then deserialize round-trip
+        // Validates: Requirements 9.3
+        //
+        // For any valid Session_State, deserializing its serialization produces
+        // a Session_State equal to the original in queue track order,
+        // current-track pointer, current position (to the nearest second),
+        // volume, shuffle mode, and repeat mode.
+        #[test]
+        fn property_session_state_round_trip(state in session_state_strategy()) {
+            let json = serde_json::to_string(&state).expect("serialize");
+            let restored: Session_State =
+                serde_json::from_str(&json).expect("deserialize");
+
+            // Whole-struct equality covers queue track order, the current-track
+            // pointer, position (already whole seconds), volume, shuffle, and
+            // repeat mode.
+            prop_assert_eq!(&restored, &state);
+
+            // Spell out the per-field guarantees the property names so a
+            // regression points at the exact field.
+            prop_assert_eq!(
+                restored
+                    .queue
+                    .tracks
+                    .iter()
+                    .map(|t| &t.track_id)
+                    .collect::<Vec<_>>(),
+                state
+                    .queue
+                    .tracks
+                    .iter()
+                    .map(|t| &t.track_id)
+                    .collect::<Vec<_>>()
+            );
+            prop_assert_eq!(restored.current_index, state.current_index);
+            prop_assert_eq!(restored.position_seconds, state.position_seconds);
+            prop_assert_eq!(restored.volume, state.volume);
+            prop_assert_eq!(restored.shuffle, state.shuffle);
+            prop_assert_eq!(restored.repeat, state.repeat);
+        }
+    }
 }

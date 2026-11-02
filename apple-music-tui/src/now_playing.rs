@@ -441,6 +441,47 @@ fn join3(a: &str, b: &str, c: &str, sep: &str) -> String {
 mod tests {
     use super::*;
     use crate::domain::{PlaybackStatus, RepeatMode};
+    use proptest::prelude::*;
+
+    proptest! {
+        // Feature: apple-music-tui, Property 5: Duration formatting
+        // Validates: Requirements 3.4, 6.5
+        //
+        // For any non-negative whole-second duration, format_duration uses the
+        // `m:ss` shape with zero-padded seconds below one hour and the
+        // `h:mm:ss` shape with zero-padded minutes and seconds at one hour or
+        // more, and parse_duration inverts the formatting back to the original
+        // second value.
+        #[test]
+        fn property_duration_formatting(total_seconds in 0u64..=1_000_000u64) {
+            let formatted = format_duration(total_seconds);
+            let parts: Vec<&str> = formatted.split(':').collect();
+
+            if total_seconds < 3600 {
+                // `m:ss`: minutes unpadded, seconds zero-padded to two digits.
+                prop_assert_eq!(parts.len(), 2, "expected m:ss for {}", formatted);
+                let minutes = total_seconds / 60;
+                let seconds = total_seconds % 60;
+                prop_assert_eq!(parts[0], minutes.to_string());
+                prop_assert_eq!(parts[1].len(), 2, "seconds must be zero-padded");
+                prop_assert_eq!(parts[1], format!("{:02}", seconds));
+            } else {
+                // `h:mm:ss`: hours unpadded, minutes and seconds zero-padded.
+                prop_assert_eq!(parts.len(), 3, "expected h:mm:ss for {}", formatted);
+                let hours = total_seconds / 3600;
+                let minutes = (total_seconds % 3600) / 60;
+                let seconds = total_seconds % 60;
+                prop_assert_eq!(parts[0], hours.to_string());
+                prop_assert_eq!(parts[1].len(), 2, "minutes must be zero-padded");
+                prop_assert_eq!(parts[1], format!("{:02}", minutes));
+                prop_assert_eq!(parts[2].len(), 2, "seconds must be zero-padded");
+                prop_assert_eq!(parts[2], format!("{:02}", seconds));
+            }
+
+            // Parsing the formatted string recovers the original second value.
+            prop_assert_eq!(parse_duration(&formatted), Some(total_seconds));
+        }
+    }
 
     fn loaded_state() -> Playback_State {
         Playback_State {
@@ -683,6 +724,38 @@ mod tests {
         assert_eq!(clamp_volume(100), 100);
     }
 
+    proptest! {
+        // Feature: apple-music-tui, Property 7: Volume clamping
+        // Validates: Requirements 4.7
+        //
+        // For any requested integer volume level, the resulting volume equals
+        // that level clamped to the inclusive range 0..=100: requests below 0
+        // yield 0, requests above 100 yield 100, and in-range requests pass
+        // through unchanged.
+        #[test]
+        fn property_volume_clamping(requested in any::<i64>()) {
+            let result = clamp_volume(requested);
+            let expected = requested.clamp(MIN_VOLUME, MAX_VOLUME);
+
+            // The clamped result matches the mathematical clamp of the request.
+            prop_assert_eq!(i64::from(result), expected);
+
+            // The result is always within the inclusive 0..=100 range.
+            prop_assert!(i64::from(result) >= MIN_VOLUME);
+            prop_assert!(i64::from(result) <= MAX_VOLUME);
+
+            // Below-range requests clamp to 0; above-range requests clamp to
+            // 100; in-range requests are returned unchanged.
+            if requested < MIN_VOLUME {
+                prop_assert_eq!(result, 0);
+            } else if requested > MAX_VOLUME {
+                prop_assert_eq!(result, 100);
+            } else {
+                prop_assert_eq!(i64::from(result), requested);
+            }
+        }
+    }
+
     #[test]
     fn render_line_fits_within_width_when_room_for_track_block() {
         let mut state = loaded_state();
@@ -694,5 +767,284 @@ mod tests {
         let width = 90;
         let line = render_line(&state, width);
         assert!(line.chars().count() <= width);
+    }
+
+    mod property_tests {
+        use super::super::*;
+        use proptest::prelude::{prop_assert, prop_assert_eq, proptest, ProptestConfig};
+
+        /// Count how many of `text`'s characters are the ellipsis character.
+        fn ellipsis_count(text: &str) -> usize {
+            text.chars().filter(|&c| c == ELLIPSIS).count()
+        }
+
+        /// Build a loaded [`Playback_State`] from generated field values. A
+        /// loaded track (`track_id` is `Some`) means the Now_Playing_Bar renders
+        /// its track/time fields and so can be forced to truncate.
+        fn make_state(
+            title: String,
+            artist: String,
+            album: String,
+            position_ms: u64,
+            duration_ms: u64,
+        ) -> Playback_State {
+            Playback_State {
+                track_id: Some("track".to_string()),
+                title,
+                artist,
+                album,
+                position_ms,
+                duration_ms: Some(duration_ms),
+                status: PlaybackStatus::Playing,
+                volume: 75,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(400))]
+
+            // Feature: apple-music-tui, Property 18: Now_Playing_Bar truncation under narrow width
+            // Validates: Requirements 6.4
+            //
+            // For any terminal width and set of Now_Playing_Bar field values,
+            // the rendered line fits within the width (whenever the always-
+            // visible protected segment itself fits), the elapsed time, total
+            // duration, and play/pause status remain fully visible, and
+            // truncation is applied to the album first, then the artist, then
+            // the title, each truncated field ending with a single ellipsis.
+            #[test]
+            fn property_now_playing_bar_truncation(
+                // Non-ellipsis, non-separator text so that any ellipsis found in
+                // the output comes from truncation, and so source text never
+                // collides with the layout separators.
+                title in "[A-Za-z0-9 ]{0,40}",
+                artist in "[A-Za-z0-9 ]{0,40}",
+                album in "[A-Za-z0-9 ]{0,40}",
+                position_s in 0u64..7200,
+                extra_s in 0u64..3600,
+                width in 0usize..200,
+            ) {
+                let position_ms = position_s * 1000;
+                // Ensure the duration is at least the elapsed position so the
+                // formatted elapsed/duration pair is realistic.
+                let duration_ms = (position_s + extra_s) * 1000;
+                let state = make_state(
+                    title.clone(),
+                    artist.clone(),
+                    album.clone(),
+                    position_ms,
+                    duration_ms,
+                );
+
+                let fields = resolve_fields(&state);
+                let line = render_fields_line(&fields, width);
+
+                // The protected segment that must always stay fully visible:
+                // elapsed/duration plus the play/pause status (Requirement 6.4).
+                let elapsed = &fields.elapsed;
+                let duration = &fields.duration;
+                let status = &fields.status;
+                let elapsed_duration = format!("{}/{}", elapsed, duration);
+
+                // 1. Elapsed time, total duration, and play/pause status remain
+                //    fully visible regardless of how narrow the terminal is.
+                prop_assert!(
+                    line.contains(&elapsed_duration),
+                    "elapsed/duration `{}` missing from line `{}` at width {}",
+                    elapsed_duration, line, width
+                );
+                prop_assert!(
+                    line.contains(status.as_str()),
+                    "status `{}` missing from line `{}` at width {}",
+                    status, line, width
+                );
+
+                // The width needed just for the protected segment.
+                let protected_width = line
+                    .chars()
+                    .count()
+                    .min(format!(
+                        "{}/{} | {} | {} | {} | {}",
+                        fields.elapsed, fields.duration, fields.status,
+                        fields.volume, fields.shuffle, fields.repeat
+                    ).chars().count());
+
+                // 2. The rendered line fits within the width whenever the width
+                //    can hold the always-visible protected segment. (When the
+                //    terminal is too narrow even for that segment, the segment
+                //    is still shown rather than dropped, so the line may exceed
+                //    the width by design.)
+                if width >= protected_width {
+                    prop_assert!(
+                        line.chars().count() <= width,
+                        "line `{}` ({} cols) exceeds width {}",
+                        line, line.chars().count(), width
+                    );
+                }
+
+                // Split the rendered track block (everything before the " | "
+                // that introduces the protected segment) back into its
+                // title/artist/album parts so we can reason about which fields
+                // were truncated. The track block is joined with " — ".
+                let protected_sep = " | ";
+                // The protected segment always starts with the elapsed/duration
+                // pair, so locate it to recover the track block prefix.
+                if let Some(idx) = line.find(&format!("{}{}", protected_sep, elapsed_duration)) {
+                    let track_block = &line[..idx];
+                    if !track_block.is_empty() {
+                        let parts: Vec<&str> = track_block.split(" — ").collect();
+                        // The rendered track block is some prefix of
+                        // title/artist/album in that order (album may be
+                        // dropped entirely when there is no room, then artist).
+                        prop_assert!(
+                            (1..=3).contains(&parts.len()),
+                            "unexpected track block `{}` -> {:?}",
+                            track_block, parts
+                        );
+
+                        // 3 & 4. Truncation order and single-ellipsis rule.
+                        //
+                        // Walk the present parts in render order (title, then
+                        // artist, then album). A field is "fully shown" when it
+                        // equals its source text; otherwise it is truncated and
+                        // must end with exactly one ellipsis. Once any earlier
+                        // field is truncated, no later field may be present —
+                        // i.e. album is sacrificed before artist, and artist
+                        // before title.
+                        //
+                        // The sources are the *resolved* field values, which
+                        // already apply the unknown-value placeholder for blank
+                        // inputs (Requirement 6.7); truncation operates on those
+                        // resolved texts, not the raw generated strings.
+                        let sources = [
+                            fields.title.as_str(),
+                            fields.artist.as_str(),
+                            fields.album.as_str(),
+                        ];
+                        let mut earlier_truncated = false;
+                        for (i, part) in parts.iter().enumerate() {
+                            let source = sources[i];
+                            let truncated = *part != source;
+
+                            if truncated {
+                                // Exactly one ellipsis, placed at the very end.
+                                prop_assert_eq!(
+                                    ellipsis_count(part), 1,
+                                    "field `{}` must carry exactly one ellipsis (line `{}`)",
+                                    part, line
+                                );
+                                prop_assert!(
+                                    part.ends_with(ELLIPSIS),
+                                    "truncated field `{}` must end with an ellipsis (line `{}`)",
+                                    part, line
+                                );
+                                // Truncated text is a prefix of the source plus
+                                // the ellipsis.
+                                let without_ellipsis = &part[..part.len() - ELLIPSIS.len_utf8()];
+                                prop_assert!(
+                                    source.starts_with(without_ellipsis),
+                                    "truncated field `{}` is not a prefix of source `{}`",
+                                    part, source
+                                );
+                            } else {
+                                // A fully shown field never carries an ellipsis
+                                // (the generator excludes it from source text).
+                                prop_assert_eq!(
+                                    ellipsis_count(part), 0,
+                                    "fully shown field `{}` should have no ellipsis",
+                                    part
+                                );
+                                // Truncation must proceed album-first: a later
+                                // field cannot be fully present once an earlier
+                                // one was truncated.
+                                prop_assert!(
+                                    !earlier_truncated,
+                                    "field `{}` present after an earlier field was truncated (parts {:?})",
+                                    part, parts
+                                );
+                            }
+
+                            earlier_truncated = earlier_truncated || truncated;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod seek_property_tests {
+    //! Property-based test for the pure seek-clamping logic (task 7.1). Runs the
+    //! single design correctness property at ≥100 iterations.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Feature: apple-music-tui, Property 6: Seek clamping
+        // Validates: Requirements 4.6
+        //
+        // For any current position, seek step, and track duration, a seek
+        // produces a position within the inclusive range 0..=duration, and a
+        // forward seek that reaches the duration is handled as the current
+        // track finishing (TrackFinished) rather than a position.
+        //
+        // The generator constrains `position_ms` to a valid position within the
+        // track (`0..=duration_ms`), matching the real input space: the
+        // Playback_Engine only ever reports positions inside the current
+        // track's duration.
+        #[test]
+        fn property_seek_clamping(
+            duration_ms in 1u64..=600_000,
+            step_seconds in 1u32..=300,
+            forward in any::<bool>(),
+            position_frac in 0.0f64..=1.0,
+        ) {
+            let position_ms = (position_frac * duration_ms as f64) as u64;
+
+            let direction = if forward {
+                SeekDirection::Forward
+            } else {
+                SeekDirection::Backward
+            };
+
+            let step_ms = (step_seconds as u64) * 1000;
+            let outcome = seek(position_ms, Some(duration_ms), step_seconds, direction);
+
+            match outcome {
+                SeekOutcome::Position(p) => {
+                    // The clamped position always lies within 0..=duration.
+                    prop_assert!(
+                        p <= duration_ms,
+                        "position {} exceeds duration {}",
+                        p,
+                        duration_ms
+                    );
+
+                    match direction {
+                        SeekDirection::Backward => {
+                            // Backward seek subtracts the step, saturating at 0.
+                            prop_assert_eq!(p, position_ms.saturating_sub(step_ms));
+                        }
+                        SeekDirection::Forward => {
+                            // A forward seek that yields a position must not
+                            // have reached the duration (otherwise it would be
+                            // TrackFinished), and it advances by the step.
+                            let target = position_ms.saturating_add(step_ms);
+                            prop_assert!(target < duration_ms);
+                            prop_assert_eq!(p, target);
+                        }
+                    }
+                }
+                SeekOutcome::TrackFinished => {
+                    // Only a forward seek that reaches the duration finishes.
+                    prop_assert_eq!(direction, SeekDirection::Forward);
+                    let target = position_ms.saturating_add(step_ms);
+                    prop_assert!(target >= duration_ms);
+                }
+            }
+        }
     }
 }

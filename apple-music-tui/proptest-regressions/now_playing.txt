@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 53d45593e5d3f3fcd1f3cb8909ba6cd45890660580ae7819ca92f9676439f8df # shrinks to position_ms = 168522, duration_ms = 1, step_seconds = 1, forward = false
+cc accdec4c64c03658e7292627247e28c519816a8c1f968fda37b48ca250557c38 # shrinks to title = "", artist = "", album = "", position_s = 0, extra_s = 0, width = 57

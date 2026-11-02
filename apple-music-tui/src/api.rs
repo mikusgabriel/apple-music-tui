@@ -1398,6 +1398,194 @@ mod search_property_tests {
             prop_assert_eq!(coord.current(), Some(latest));
         }
     }
+
+    /// One of the four mappable resource kinds, used to drive the generator
+    /// below so each generated resource carries the right `type` and the
+    /// optional attributes that kind supports.
+    #[derive(Debug, Clone, Copy)]
+    enum Kind {
+        Song,
+        Album,
+        Artist,
+        Playlist,
+    }
+
+    impl Kind {
+        fn type_name(self) -> &'static str {
+            match self {
+                Kind::Song => "songs",
+                Kind::Album => "albums",
+                Kind::Artist => "artists",
+                Kind::Playlist => "playlists",
+            }
+        }
+    }
+
+    /// A generated resource together with the attribute values that were
+    /// *present* when it was built, so the test can assert the mapped
+    /// Domain_Object preserved exactly those and substituted the documented
+    /// defaults for the absent ones (Requirement 12.1, 12.2).
+    #[derive(Debug, Clone)]
+    struct GenResource {
+        kind: Kind,
+        id: String,
+        name: String,
+        /// `Some` when `artistName` was present in the resource; `None` when it
+        /// was omitted. Only songs/albums carry an artist name.
+        artist_name: Option<String>,
+        /// `Some` when `durationInMillis` was present (songs only).
+        duration_ms: Option<u64>,
+        /// `Some` when an `artwork.url` was present.
+        artwork_url: Option<String>,
+        /// `Some(flag)` when `isPlayable` was present (songs only).
+        is_playable: Option<bool>,
+    }
+
+    impl GenResource {
+        /// Build the JSON resource the mapper consumes, including only the
+        /// attributes that were marked present.
+        fn to_json(&self) -> Value {
+            let mut attributes = serde_json::Map::new();
+            attributes.insert("name".to_string(), json!(self.name));
+            if let Some(ref artist) = self.artist_name {
+                attributes.insert("artistName".to_string(), json!(artist));
+            }
+            if let Some(duration) = self.duration_ms {
+                attributes.insert("durationInMillis".to_string(), json!(duration));
+            }
+            if let Some(ref url) = self.artwork_url {
+                attributes.insert("artwork".to_string(), json!({ "url": url }));
+            }
+            if let Some(flag) = self.is_playable {
+                attributes.insert("isPlayable".to_string(), json!(flag));
+            }
+            json!({
+                "id": self.id,
+                "type": self.kind.type_name(),
+                "attributes": Value::Object(attributes),
+            })
+        }
+
+        /// The Domain_Object the mapper must produce: present attributes are
+        /// preserved verbatim, absent text attributes become the empty string,
+        /// an absent duration becomes `None`, and an absent `isPlayable`
+        /// defaults to `true` (Requirement 12.1, 12.2).
+        fn expected(&self) -> Domain_Object {
+            match self.kind {
+                Kind::Song => Domain_Object::Song {
+                    id: self.id.clone(),
+                    name: self.name.clone(),
+                    artist_name: self.artist_name.clone().unwrap_or_default(),
+                    duration_ms: self.duration_ms,
+                    artwork_url: self.artwork_url.clone(),
+                    is_playable: self.is_playable.unwrap_or(true),
+                },
+                Kind::Album => Domain_Object::Album {
+                    id: self.id.clone(),
+                    name: self.name.clone(),
+                    artist_name: self.artist_name.clone().unwrap_or_default(),
+                    artwork_url: self.artwork_url.clone(),
+                },
+                Kind::Artist => Domain_Object::Artist {
+                    id: self.id.clone(),
+                    name: self.name.clone(),
+                    artwork_url: self.artwork_url.clone(),
+                },
+                Kind::Playlist => Domain_Object::Playlist {
+                    id: self.id.clone(),
+                    name: self.name.clone(),
+                    artwork_url: self.artwork_url.clone(),
+                },
+            }
+        }
+    }
+
+    /// A strategy for non-empty strings (so `id`/`name` are always *present*),
+    /// including non-ASCII so the mapper is exercised on multi-byte text.
+    fn non_empty_text() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9 é★日本語_-]{1,24}".prop_filter("must be non-empty", |s| !s.is_empty())
+    }
+
+    /// A strategy producing a resource that always has a non-empty id and name
+    /// (so it is never dropped) and randomly includes or omits each optional
+    /// attribute supported by its kind. Artist/duration/isPlayable only apply
+    /// to the kinds that carry them, so those are forced to `None` elsewhere to
+    /// match what the mapper can ever populate.
+    fn resource_strategy() -> impl Strategy<Value = GenResource> {
+        let kind = prop_oneof![
+            Just(Kind::Song),
+            Just(Kind::Album),
+            Just(Kind::Artist),
+            Just(Kind::Playlist),
+        ];
+        (
+            kind,
+            non_empty_text(),
+            non_empty_text(),
+            proptest::option::of(".{0,24}"),
+            proptest::option::of(0u64..1_000_000),
+            // A non-empty url, since the mapper treats an empty url as absent.
+            proptest::option::of(non_empty_text()),
+            proptest::option::of(any::<bool>()),
+        )
+            .prop_map(
+                |(kind, id, name, artist, duration, artwork, playable)| {
+                    // Restrict each optional attribute to the kinds that carry
+                    // it so `expected()` matches the mapper's variant shape.
+                    let (artist_name, duration_ms, is_playable) = match kind {
+                        Kind::Song => (artist, duration, playable),
+                        Kind::Album => (artist, None, None),
+                        Kind::Artist | Kind::Playlist => (None, None, None),
+                    };
+                    GenResource {
+                        kind,
+                        id,
+                        name,
+                        artist_name,
+                        duration_ms,
+                        artwork_url: artwork,
+                        is_playable,
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 25: Domain_Object mapping preserves present attributes
+        // Validates: Requirements 12.1, 12.2
+        //
+        // For any list of successful-response resources that each have an id and
+        // a name, mapping produces exactly one Domain_Object per resource (none
+        // is ever dropped), in input order, that preserves every present
+        // attribute, substitutes an empty string for each missing text
+        // attribute, and `None` for a missing duration.
+        #[test]
+        fn property_mapping_preserves_present_attributes(
+            resources in prop::collection::vec(resource_strategy(), 0..12)
+        ) {
+            let json_resources: Vec<Value> =
+                resources.iter().map(GenResource::to_json).collect();
+
+            let outcome = map_resources(&json_resources);
+
+            // Every id/name-bearing resource is included: none dropped, count
+            // and order preserved.
+            prop_assert!(
+                outcome.dropped.is_empty(),
+                "no id/name-bearing resource should be dropped, got {:?}",
+                outcome.dropped
+            );
+            prop_assert_eq!(outcome.objects.len(), resources.len());
+
+            for (generated, mapped) in resources.iter().zip(outcome.objects.iter()) {
+                // The mapped object preserves present attributes and applies the
+                // documented substitutions for absent ones.
+                prop_assert_eq!(mapped, &generated.expected());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1674,6 +1862,150 @@ mod tests {
         assert!(outcome.objects.is_empty());
         assert_eq!(outcome.dropped.len(), 1);
         assert_eq!(outcome.dropped[0].reason, DropReason::NotAnObject);
+    }
+}
+
+#[cfg(test)]
+mod mapping_property_tests {
+    //! Property-based tests for the pure resource mapping layer (task 7.6).
+    //! Each test exercises one design correctness property at >=100 iterations.
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::{json, Value};
+
+    /// The four known resource types that map to a `Domain_Object` variant.
+    const KNOWN_TYPES: [&str; 4] = ["songs", "albums", "artists", "playlists"];
+
+    /// One generated resource, carrying whether it is well-formed so the test
+    /// can count expectations independently of the mapper under test.
+    #[derive(Debug, Clone)]
+    struct GeneratedResource {
+        value: Value,
+        /// `true` when the resource has both a non-empty `id` and a non-empty
+        /// `name` and a known `type`, so it should map to a `Domain_Object`;
+        /// `false` when it is missing an `id` or a `name`, so it is dropped.
+        well_formed: bool,
+    }
+
+    /// How a generated resource is made malformed (missing a required field).
+    #[derive(Debug, Clone, Copy)]
+    enum Malformation {
+        /// Omit the `id` field entirely.
+        MissingId,
+        /// Present but empty `id` (counts as missing, Requirement 12.3).
+        EmptyId,
+        /// Omit the `name` attribute entirely.
+        MissingName,
+        /// Present but empty `name` (counts as missing, Requirement 12.3).
+        EmptyName,
+    }
+
+    /// Strategy for a well-formed resource: a known type with a non-empty id and
+    /// a non-empty name (plus arbitrary optional attributes that never affect
+    /// the kept/dropped decision).
+    fn well_formed_resource() -> impl Strategy<Value = GeneratedResource> {
+        (
+            prop::sample::select(KNOWN_TYPES.as_slice()),
+            "[a-zA-Z0-9]{1,8}",
+            "[a-zA-Z0-9 ]{1,12}",
+        )
+            .prop_map(|(kind, id, name)| GeneratedResource {
+                value: json!({
+                    "id": id,
+                    "type": kind,
+                    "attributes": { "name": name }
+                }),
+                well_formed: true,
+            })
+    }
+
+    /// Strategy for a malformed resource: a known type whose `id` or `name` is
+    /// missing or empty. Everything else is well-formed so the *only* reason the
+    /// resource is dropped is the missing required field.
+    fn malformed_resource() -> impl Strategy<Value = GeneratedResource> {
+        let malformation = prop_oneof![
+            Just(Malformation::MissingId),
+            Just(Malformation::EmptyId),
+            Just(Malformation::MissingName),
+            Just(Malformation::EmptyName),
+        ];
+        (
+            prop::sample::select(KNOWN_TYPES.as_slice()),
+            "[a-zA-Z0-9]{1,8}",
+            "[a-zA-Z0-9 ]{1,12}",
+            malformation,
+        )
+            .prop_map(|(kind, id, name, how)| {
+                let value = match how {
+                    Malformation::MissingId => json!({
+                        "type": kind,
+                        "attributes": { "name": name }
+                    }),
+                    Malformation::EmptyId => json!({
+                        "id": "",
+                        "type": kind,
+                        "attributes": { "name": name }
+                    }),
+                    Malformation::MissingName => json!({
+                        "id": id,
+                        "type": kind,
+                        "attributes": {}
+                    }),
+                    Malformation::EmptyName => json!({
+                        "id": id,
+                        "type": kind,
+                        "attributes": { "name": "" }
+                    }),
+                };
+                GeneratedResource {
+                    value,
+                    well_formed: false,
+                }
+            })
+    }
+
+    /// Strategy for an arbitrary list mixing well-formed and malformed
+    /// resources in any order and proportion (including all-good and all-bad).
+    fn mixed_resources() -> impl Strategy<Value = Vec<GeneratedResource>> {
+        prop::collection::vec(
+            prop_oneof![well_formed_resource(), malformed_resource()],
+            0..24,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: apple-music-tui, Property 26: Malformed resources are dropped, the rest returned
+        // Validates: Requirements 12.3
+        //
+        // For any successful response mixing well-formed resources with
+        // resources missing an id or name, the mapped result contains exactly
+        // the well-formed resources, and the number of omitted resources equals
+        // the number missing an id or name.
+        #[test]
+        fn property_malformed_resources_dropped_rest_returned(resources in mixed_resources()) {
+            let expected_kept = resources.iter().filter(|r| r.well_formed).count();
+            let expected_dropped = resources.iter().filter(|r| !r.well_formed).count();
+
+            let values: Vec<Value> = resources.iter().map(|r| r.value.clone()).collect();
+            let outcome = map_resources(&values);
+
+            // Exactly the well-formed resources are returned...
+            prop_assert_eq!(outcome.objects.len(), expected_kept);
+            // ...and the number of omitted resources equals the number missing
+            // an id or name.
+            prop_assert_eq!(outcome.dropped.len(), expected_dropped);
+            // Every input resource is accounted for exactly once.
+            prop_assert_eq!(outcome.objects.len() + outcome.dropped.len(), values.len());
+            // Every dropped resource was omitted for a missing id or name.
+            for dropped in &outcome.dropped {
+                prop_assert!(matches!(
+                    dropped.reason,
+                    DropReason::MissingId | DropReason::MissingName
+                ));
+            }
+        }
     }
 }
 
@@ -3128,5 +3460,126 @@ mod transport_tests {
             })
         );
         assert!(waits.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod backoff_property_tests {
+    //! Property-based test for the rate-limit backoff schedule (task 9.5).
+    //!
+    //! Exercises the single design correctness property at >=100 iterations.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A generated `Retry-After` header value paired with the number of seconds
+    /// it should be interpreted as under the Requirement 12.6 rule *before*
+    /// defaulting and capping: `Some(n)` for a non-negative integer header and
+    /// `None` for an absent header or any value that is not a non-negative
+    /// integer (negative, fractional, non-numeric, or an HTTP-date).
+    #[derive(Debug, Clone)]
+    struct RetryAfterCase {
+        /// The raw header value, or `None` to model an absent header.
+        header: Option<String>,
+        /// `Some(seconds)` when the header is a non-negative integer, else
+        /// `None` (the "default to 1 second" case).
+        parsed_seconds: Option<u64>,
+    }
+
+    /// Generate the spread of `Retry-After` header values called out by the
+    /// task: non-negative integers, negatives, fractional values, non-numeric
+    /// text, HTTP-dates, and the absent header.
+    fn retry_after_case() -> impl Strategy<Value = RetryAfterCase> {
+        // A handful of real HTTP-date strings (the other accepted RFC 7231 form
+        // of Retry-After), all of which must fall back to the default.
+        let http_dates = prop::sample::select(vec![
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "Fri, 31 Dec 1999 23:59:59 GMT",
+            "Mon, 01 Jan 2024 00:00:00 GMT",
+        ])
+        .prop_map(|s| s.to_string());
+
+        prop_oneof![
+            // Non-negative integer, optionally padded with surrounding spaces
+            // (headers are commonly space-padded and must still be accepted).
+            (any::<u64>(), 0usize..3, 0usize..3).prop_map(|(n, lead, trail)| {
+                let header = format!("{}{n}{}", " ".repeat(lead), " ".repeat(trail));
+                RetryAfterCase {
+                    header: Some(header),
+                    parsed_seconds: Some(n),
+                }
+            }),
+            // Negative integers -> not a non-negative integer -> default.
+            (1i64..=1_000_000).prop_map(|n| RetryAfterCase {
+                header: Some(format!("-{n}")),
+                parsed_seconds: None,
+            }),
+            // Fractional values -> default.
+            (0u64..1000, 1u64..1000).prop_map(|(whole, frac)| RetryAfterCase {
+                header: Some(format!("{whole}.{frac}")),
+                parsed_seconds: None,
+            }),
+            // Arbitrary non-numeric text -> default. Constrained to characters
+            // that never form a bare integer so the expected value is stable.
+            "[A-Za-z_][A-Za-z0-9 _-]{0,20}".prop_map(|s| RetryAfterCase {
+                header: Some(s),
+                parsed_seconds: None,
+            }),
+            // Empty / whitespace-only header -> default.
+            (0usize..5).prop_map(|n| RetryAfterCase {
+                header: Some(" ".repeat(n)),
+                parsed_seconds: None,
+            }),
+            // HTTP-date form -> treated as "not a non-negative integer" -> default.
+            http_dates.prop_map(|s| RetryAfterCase {
+                header: Some(s),
+                parsed_seconds: None,
+            }),
+            // Absent header -> default.
+            Just(RetryAfterCase {
+                header: None,
+                parsed_seconds: None,
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        // Feature: apple-music-tui, Property 27: Rate-limit backoff schedule
+        // Validates: Requirements 12.6
+        #[test]
+        fn property_rate_limit_backoff_schedule(case in retry_after_case()) {
+            let header = case.header.as_deref();
+
+            // Expected per-attempt wait: the header value in seconds when it is
+            // a non-negative integer, 1 second otherwise, then capped at 60.
+            let expected_secs = case
+                .parsed_seconds
+                .unwrap_or(DEFAULT_BACKOFF_SECONDS)
+                .min(MAX_BACKOFF_SECONDS);
+            let expected = Duration::from_secs(expected_secs);
+
+            // Single-attempt wait matches the rule exactly.
+            prop_assert_eq!(backoff_delay(header), expected);
+
+            // The computed wait never exceeds the 60-second per-attempt cap.
+            prop_assert!(backoff_delay(header) <= Duration::from_secs(MAX_BACKOFF_SECONDS));
+
+            // When the header carries no non-negative integer, the wait is the
+            // 1-second default (before capping, which cannot lower 1s).
+            if case.parsed_seconds.is_none() {
+                prop_assert_eq!(backoff_delay(header), Duration::from_secs(DEFAULT_BACKOFF_SECONDS));
+            }
+
+            // The schedule holds at most three retry attempts, each equal to the
+            // per-attempt wait.
+            let schedule = backoff_schedule(header);
+            prop_assert!(schedule.len() <= MAX_RETRY_ATTEMPTS as usize);
+            prop_assert_eq!(schedule.len(), MAX_RETRY_ATTEMPTS as usize);
+            for wait in &schedule {
+                prop_assert_eq!(*wait, expected);
+                prop_assert!(*wait <= Duration::from_secs(MAX_BACKOFF_SECONDS));
+            }
+        }
     }
 }

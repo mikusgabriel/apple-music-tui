@@ -382,9 +382,9 @@ fn jwt_candidates(assets: &str) -> impl Iterator<Item = String> + '_ {
 ///
 /// Apple Music's `index.html` references hashed bundle files such as
 /// `/assets/index-<hash>.js`. This returns the first `src`/`href` that points
-/// at a `.js` asset, resolved against [`WEB_PLAYER_URL`]. Returns `None` when
-/// the HTML references no JavaScript bundle.
-fn find_bundle_url(html: &str) -> Option<String> {
+/// at a `.js` asset, resolved against `base_url` (the web-player origin).
+/// Returns `None` when the HTML references no JavaScript bundle.
+fn find_bundle_url(html: &str, base_url: &str) -> Option<String> {
     // Scan for attribute values ending in `.js`. Values are delimited by single
     // or double quotes in the HTML.
     for quote in ['"', '\''] {
@@ -397,7 +397,7 @@ fn find_bundle_url(html: &str) -> Option<String> {
             let value = &after[..close];
             if value.ends_with(".js") && (value.contains("assets") || value.contains("main"))
             {
-                return Some(resolve_url(value));
+                return Some(resolve_url(value, base_url));
             }
             rest = &after[close + 1..];
         }
@@ -412,7 +412,7 @@ fn find_bundle_url(html: &str) -> Option<String> {
             };
             let value = &after[..close];
             if value.ends_with(".js") {
-                return Some(resolve_url(value));
+                return Some(resolve_url(value, base_url));
             }
             rest = &after[close + 1..];
         }
@@ -420,14 +420,15 @@ fn find_bundle_url(html: &str) -> Option<String> {
     None
 }
 
-/// Resolve a possibly-relative asset path against the web-player origin.
-fn resolve_url(value: &str) -> String {
+/// Resolve a possibly-relative asset path against the web-player origin
+/// `base_url` (in production [`WEB_PLAYER_URL`]).
+fn resolve_url(value: &str, base_url: &str) -> String {
     if value.starts_with("http://") || value.starts_with("https://") {
         value.to_string()
     } else if let Some(stripped) = value.strip_prefix('/') {
-        format!("{WEB_PLAYER_URL}/{stripped}")
+        format!("{base_url}/{stripped}")
     } else {
-        format!("{WEB_PLAYER_URL}/{value}")
+        format!("{base_url}/{value}")
     }
 }
 
@@ -440,6 +441,12 @@ fn resolve_url(value: &str) -> String {
 pub struct AuthManager<C: Clock = SystemClock> {
     store: TokenStore,
     clock: C,
+    /// Origin the Developer_Token fetch targets. In production this is always
+    /// [`WEB_PLAYER_URL`] (`https://music.apple.com`); it is overridable only
+    /// so the 401/403 refresh-and-resend integration test can point the fetch
+    /// at a local mock server instead of the live, unofficial web player
+    /// (task 16.3). No production constructor sets it to anything else.
+    web_player_base_url: String,
 }
 
 impl AuthManager<SystemClock> {
@@ -448,6 +455,7 @@ impl AuthManager<SystemClock> {
         AuthManager {
             store,
             clock: SystemClock,
+            web_player_base_url: WEB_PLAYER_URL.to_string(),
         }
     }
 }
@@ -456,7 +464,25 @@ impl<C: Clock> AuthManager<C> {
     /// Build an Auth_Manager with an explicit clock, for tests that need to
     /// control "now" for the JWT validity decision (Requirement 1.8).
     pub fn with_clock(store: TokenStore, clock: C) -> Self {
-        AuthManager { store, clock }
+        AuthManager {
+            store,
+            clock,
+            web_player_base_url: WEB_PLAYER_URL.to_string(),
+        }
+    }
+
+    /// Override the origin the Developer_Token fetch targets.
+    ///
+    /// This is a test-only seam (hidden from the public docs): it lets the
+    /// 401/403 refresh-and-resend integration test (task 16.3) serve the
+    /// web-player assets — and thus the refreshed Developer_Token — from a local
+    /// mock HTTP server, so the flow is exercised entirely offline instead of
+    /// hitting the live music.apple.com assets. Production code never calls
+    /// this, so the fetch always targets [`WEB_PLAYER_URL`].
+    #[doc(hidden)]
+    pub fn with_web_player_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.web_player_base_url = base_url.into();
+        self
     }
 
     /// Return a usable Developer_Token, fetching a fresh one when necessary
@@ -609,7 +635,8 @@ impl<C: Clock> AuthManager<C> {
 
         // The 10-second budget covers the entire fetch (HTML + bundle), so wrap
         // the whole operation in a single timeout rather than per-request.
-        match tokio::time::timeout(FETCH_TIMEOUT, fetch_token_with(&client)).await {
+        let base_url = self.web_player_base_url.clone();
+        match tokio::time::timeout(FETCH_TIMEOUT, fetch_token_with(&client, &base_url)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(DeveloperTokenError::Timeout),
         }
@@ -619,10 +646,14 @@ impl<C: Clock> AuthManager<C> {
 /// Perform the two-step fetch with an already-built client: download the HTML,
 /// find and download the JS bundle, and extract the token. Separated from the
 /// timeout wrapper so the sequence is readable.
+///
+/// `base_url` is the web-player origin; it is [`WEB_PLAYER_URL`] in production
+/// and only differs when a test points the fetch at a mock server (task 16.3).
 async fn fetch_token_with(
     client: &reqwest::Client,
+    base_url: &str,
 ) -> Result<SecretString, DeveloperTokenError> {
-    let html = get_text(client, WEB_PLAYER_URL).await?;
+    let html = get_text(client, base_url).await?;
 
     // The token sometimes appears inline in the HTML; check there first so a
     // layout change that inlines the token still works.
@@ -630,7 +661,8 @@ async fn fetch_token_with(
         return Ok(SecretString::new(token));
     }
 
-    let bundle_url = find_bundle_url(&html).ok_or(DeveloperTokenError::NoTokenInAssets)?;
+    let bundle_url =
+        find_bundle_url(&html, base_url).ok_or(DeveloperTokenError::NoTokenInAssets)?;
     let bundle = get_text(client, &bundle_url).await?;
     match extract_developer_token(&bundle) {
         Some(token) => Ok(SecretString::new(token)),
@@ -885,7 +917,7 @@ mod tests {
     fn find_bundle_url_resolves_relative_assets_path() {
         let html = r#"<html><head><script type="module" src="/assets/index-abc123.js"></script></head></html>"#;
         assert_eq!(
-            find_bundle_url(html).as_deref(),
+            find_bundle_url(html, WEB_PLAYER_URL).as_deref(),
             Some("https://music.apple.com/assets/index-abc123.js")
         );
     }
@@ -894,7 +926,7 @@ mod tests {
     fn find_bundle_url_keeps_absolute_url() {
         let html = r#"<script src="https://cdn.apple.com/main-9f8.js"></script>"#;
         assert_eq!(
-            find_bundle_url(html).as_deref(),
+            find_bundle_url(html, WEB_PLAYER_URL).as_deref(),
             Some("https://cdn.apple.com/main-9f8.js")
         );
     }
@@ -902,7 +934,7 @@ mod tests {
     #[test]
     fn find_bundle_url_none_without_js() {
         let html = "<html><head><link rel=stylesheet href=/x.css></head></html>";
-        assert_eq!(find_bundle_url(html), None);
+        assert_eq!(find_bundle_url(html, WEB_PLAYER_URL), None);
     }
 
     #[test]
@@ -1311,6 +1343,116 @@ mod tests {
         assert!(store.load(TokenKind::MusicUser).unwrap().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    mod property_tests {
+        use super::super::{developer_token_is_valid, MIN_REMAINING_SECS};
+        use super::{base64url_encode, jwt_with_exp};
+        use proptest::prelude::{
+            any, prop_assert, prop_assert_eq, prop_oneof, proptest, Just, ProptestConfig, Strategy,
+        };
+
+        /// Build a JWT whose payload is a JSON object carrying the given claims
+        /// but **no** `exp` claim, so it must be rejected (Requirement 1.8,
+        /// "lacks an exp claim").
+        fn jwt_without_exp(iss: &str) -> String {
+            let header = base64url_encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+            let payload = base64url_encode(format!(r#"{{"iss":"{iss}"}}"#).as_bytes());
+            format!("{header}.{payload}.c2ln")
+        }
+
+        /// Candidate kinds that span the decision's branches:
+        /// - a well-formed JWT with a known non-negative `exp`,
+        /// - a well-formed JWT with no `exp` claim,
+        /// - an arbitrary string that is not a JWT at all.
+        #[derive(Debug, Clone)]
+        enum Candidate {
+            /// A JWT with this exact `exp` (seconds since the epoch).
+            WithExp(u64),
+            /// A JWT that decodes but has no `exp` claim.
+            NoExp,
+            /// A free-form string, almost never a valid JWT.
+            Garbage(String),
+        }
+
+        /// Smart generator constraining to the input space the decision cares
+        /// about: `exp` values are drawn across the whole u64 range (so both
+        /// far-future and past/near expiries occur), alongside exp-less JWTs
+        /// and arbitrary non-JWT strings.
+        fn candidate_strategy() -> impl Strategy<Value = Candidate> {
+            prop_oneof![
+                // Draw `exp` across the full range a JWT can faithfully carry:
+                // a non-negative JSON integer, i.e. `0..=i64::MAX` seconds. This
+                // spans both far-future and past/near expiries so the
+                // `>= now + 60` boundary is exercised on both sides across the
+                // clock values below.
+                (0u64..=i64::MAX as u64).prop_map(Candidate::WithExp),
+                Just(Candidate::NoExp),
+                // Non-JWT strings: dotted and undotted ASCII runs that should
+                // overwhelmingly fail to decode as a JWT with an `exp` claim.
+                "[A-Za-z0-9._-]{0,40}".prop_map(Candidate::Garbage),
+            ]
+        }
+
+        /// Render a [`Candidate`] to its token string.
+        fn render(candidate: &Candidate) -> String {
+            match candidate {
+                Candidate::WithExp(exp) => jwt_with_exp(*exp as i64),
+                Candidate::NoExp => jwt_without_exp("ABCDE"),
+                Candidate::Garbage(s) => s.clone(),
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(400))]
+
+            // Feature: apple-music-tui, Property 1: Developer_Token validity decision
+            // Validates: Requirements 1.8
+            //
+            // For any candidate Developer_Token string and any current time, the
+            // Auth_Manager accepts the token if and only if it decodes as a JWT,
+            // contains an `exp` claim, and that `exp` is at least 60 seconds
+            // after the current time; otherwise it is discarded.
+            #[test]
+            fn property_developer_token_validity_decision(
+                candidate in candidate_strategy(),
+                now in any::<u64>(),
+            ) {
+                let token = render(&candidate);
+                let accepted = developer_token_is_valid(&token, now);
+
+                // The acceptance threshold: `exp` must be at least 60 seconds
+                // ahead of `now`, computed without overflow at the u64 ceiling.
+                let threshold = now.saturating_add(MIN_REMAINING_SECS);
+
+                match &candidate {
+                    // A JWT with a known `exp` is accepted iff `exp >= now + 60`.
+                    Candidate::WithExp(exp) => {
+                        prop_assert_eq!(accepted, *exp >= threshold);
+                    }
+                    // A JWT without an `exp` claim is always discarded.
+                    Candidate::NoExp => {
+                        prop_assert!(!accepted, "token lacking an exp claim must be rejected");
+                    }
+                    // Non-JWT garbage is discarded unless it happens to be a
+                    // valid JWT with a sufficiently-future `exp` (vanishingly
+                    // rare). In that case the decode-based oracle still agrees.
+                    Candidate::Garbage(_) => {
+                        let decoded = super::super::decode_jwt_exp(&token);
+                        let expected = matches!(decoded, Some(exp) if exp >= threshold);
+                        prop_assert_eq!(accepted, expected);
+                    }
+                }
+
+                // Regardless of shape, the decision must agree with decoding the
+                // `exp` directly and comparing against the 60-second threshold.
+                let oracle = matches!(
+                    super::super::decode_jwt_exp(&token),
+                    Some(exp) if exp >= threshold
+                );
+                prop_assert_eq!(accepted, oracle);
+            }
+        }
     }
 
     #[test]

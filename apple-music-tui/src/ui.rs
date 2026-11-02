@@ -642,6 +642,19 @@ fn draw(guard: &mut TerminalGuard, app: &App) -> io::Result<()> {
     Ok(())
 }
 
+/// Render the whole application into an arbitrary [`Frame`] (Requirement 10.1,
+/// 12.10).
+///
+/// This is the same render path the live loop uses via [`draw`], exposed so a
+/// backend-agnostic harness (for example ratatui's `TestBackend`) can draw the
+/// app at any terminal size. It is the single public entry point for rendering
+/// a frame, which the resize-redraw integration test (task 16.3) uses to assert
+/// the views and the Now_Playing_Bar fit each column/row dimension. It performs
+/// no terminal I/O itself; it only paints `frame`.
+pub fn render_app(frame: &mut Frame, app: &App) {
+    render_main_view(frame, app);
+}
+
 /// Render the main-view layout skeleton (Requirement 10.1).
 ///
 /// Three vertical regions: a one-line navigation bar at the top, the view's
@@ -1588,6 +1601,22 @@ pub fn render_library_view(frame: &mut Frame, area: Rect, state: &LibraryViewSta
     }
 }
 
+/// The message shown in place of the item list when a Library section,
+/// playlist, or album has loaded zero items (Requirement 3.8).
+///
+/// When the list is empty because the last request failed (and no prior items
+/// were kept) the load-error message is shown instead (Requirement 3.7);
+/// otherwise the empty-state message is shown. Factored out of
+/// [`render_library_list`] so the exact message is unit-testable without a
+/// terminal frame.
+fn library_empty_message(has_load_error: bool) -> &'static str {
+    if has_load_error {
+        LIBRARY_LOAD_ERROR
+    } else {
+        LIBRARY_EMPTY
+    }
+}
+
 /// Render a drilled-in Library list: loading / empty / error states and the
 /// item rows (Requirements 3.2, 3.4, 3.7, 3.8).
 fn render_library_list(frame: &mut Frame, area: Rect, list: &LibraryList, selected: Option<usize>) {
@@ -1605,11 +1634,7 @@ fn render_library_list(frame: &mut Frame, area: Rect, list: &LibraryList, select
     // Empty state once a page has loaded and there is nothing to show
     // (Requirement 3.8). A load error with no prior items shows the load error.
     if list.is_empty() {
-        let message = if list.has_load_error() {
-            LIBRARY_LOAD_ERROR
-        } else {
-            LIBRARY_EMPTY
-        };
+        let message = library_empty_message(list.has_load_error());
         frame.render_widget(Paragraph::new(message).block(block), area);
         return;
     }
@@ -2498,8 +2523,22 @@ mod view_tests {
         state.set_results(pagination(SearchResults::default()));
         let rows = state.rows();
         assert_eq!(rows, vec![SearchRow::Info(SEARCH_NO_RESULTS.to_string())]);
+        // The exact user-facing zero-results message (Requirement 2.4).
+        assert_eq!(SEARCH_NO_RESULTS, "No results matched your query");
         // Nothing selectable when there are no results.
         assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn search_view_omits_every_zero_result_section_when_all_empty() {
+        // When all four resource types return zero results, no section header
+        // is rendered and only the single no-results message is shown
+        // (Requirement 2.4: omit zero-result sections).
+        let mut state = SearchViewState::new();
+        state.set_results(pagination(SearchResults::default()));
+        let rows = state.rows();
+        assert!(!rows.iter().any(|r| matches!(r, SearchRow::Header(_))));
+        assert_eq!(rows, vec![SearchRow::Info(SEARCH_NO_RESULTS.to_string())]);
     }
 
     #[test]
@@ -2863,6 +2902,63 @@ mod view_tests {
         assert!(state.activate_selection().is_none());
     }
 
+    // --- Empty-state messages (R3.8) ---
+
+    #[test]
+    fn library_empty_section_shows_exact_empty_message() {
+        // A Library section that returned zero items shows the exact
+        // empty-state message in place of the item list (Requirement 3.8).
+        let mut list = LibraryList::new(LibraryRequest::section(LibrarySection::Songs, 0));
+        let _ = list.first_page_request();
+        list.apply_page(library_page(0, false)); // loaded, no items, no error
+        assert!(list.is_empty());
+        assert!(!list.has_load_error());
+        assert_eq!(
+            library_empty_message(list.has_load_error()),
+            LIBRARY_EMPTY
+        );
+        assert_eq!(LIBRARY_EMPTY, "This section is empty");
+    }
+
+    #[test]
+    fn library_empty_playlist_shows_exact_empty_message() {
+        // An opened Library playlist with no tracks shows the empty-state
+        // message (Requirement 3.8).
+        let mut list = LibraryList::new(LibraryRequest::tracks(
+            LibrarySection::Playlists,
+            "p.empty",
+            0,
+        ));
+        let _ = list.first_page_request();
+        list.apply_page(library_page(0, false));
+        assert!(list.is_empty());
+        assert_eq!(library_empty_message(list.has_load_error()), LIBRARY_EMPTY);
+    }
+
+    #[test]
+    fn library_empty_album_shows_exact_empty_message() {
+        // An opened Library album with no tracks shows the empty-state
+        // message (Requirement 3.8).
+        let mut list = LibraryList::new(LibraryRequest::tracks(
+            LibrarySection::Albums,
+            "al.empty",
+            0,
+        ));
+        let _ = list.first_page_request();
+        list.apply_page(library_page(0, false));
+        assert!(list.is_empty());
+        assert_eq!(library_empty_message(list.has_load_error()), LIBRARY_EMPTY);
+    }
+
+    #[test]
+    fn library_empty_because_of_load_error_shows_load_error_not_empty_message() {
+        // When the list is empty because the request failed (no prior items),
+        // the load-error message is shown instead of the empty-state message
+        // (Requirement 3.7 vs 3.8), so the two are not confused.
+        assert_eq!(library_empty_message(true), LIBRARY_LOAD_ERROR);
+        assert_ne!(library_empty_message(true), LIBRARY_EMPTY);
+    }
+
     #[test]
     fn library_loading_first_page_is_reflected_in_state() {
         // Before the first page arrives the list is loading and empty, which the
@@ -2928,6 +3024,8 @@ mod queue_view_tests {
     fn empty_queue_shows_empty_message() {
         let q = Queue::new();
         assert_eq!(queue_rows(&q), vec![QueueRow::Info(QUEUE_EMPTY.to_string())]);
+        // The exact user-facing empty-Queue message (Requirement 5.10).
+        assert_eq!(QUEUE_EMPTY, "The Queue is empty");
     }
 
     #[test]
