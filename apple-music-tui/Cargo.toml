@@ -1,0 +1,27 @@
+[package]
+name = "apple-music-tui"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight, keyboard-driven Apple Music terminal UI for Linux"
+
+[dependencies]
+ratatui = "0.29"
+# `event-stream` exposes crossterm's async `EventStream`, which the TUI render
+# loop selects on alongside signals and the Now_Playing_Bar tick (task 13.1).
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1", features = ["full"] }
+# `StreamExt` for driving crossterm's async `EventStream` in the select loop.
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+zbus = "4"
+# Optional OS secret-service keyring backend for the Token_Store (Requirement
+# 1.5). Pinned exactly; the default `v1` feature pulls the zbus-backed
+# secret-service store on Linux.
+keyring = "=4.2.0"
+
+[dev-dependencies]
+proptest = "1"

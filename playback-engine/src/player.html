@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      Hidden MusicKit JS player document.
+
+      This window is never shown (BrowserWindow show:false); it exists only to
+      host MusicKit JS and the Widevine CDM for DRM-protected audio decode. All
+      control flows through the preload bridge (window.playerBridge); this page
+      has no Node/Electron access of its own.
+
+      A restrictive CSP keeps the untrusted MusicKit page from loading arbitrary
+      code: scripts and media may come only from Apple's MusicKit hosts.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' https://js-cdn.music.apple.com; connect-src https://*.music.apple.com https://*.mzstatic.com https://*.apple.com; media-src https://*.music.apple.com https://*.mzstatic.com blob:; style-src 'unsafe-inline';"
+    />
+    <title>player</title>
+    <!--
+      MusicKit JS v3. Loaded from Apple's CDN; the integrity of DRM playback
+      depends on the real library being present. When it is absent (e.g. offline
+      or during tests that do not load this document) player.js reports a drm
+      error rather than throwing.
+    -->
+    <script
+      src="https://js-cdn.music.apple.com/musickit/v3/musickit.js"
+      data-web-components
+      async
+    ></script>
+    <script src="./player.js" defer></script>
+  </head>
+  <body></body>
+</html>

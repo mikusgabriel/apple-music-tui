@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' https://js-cdn.music.apple.com; connect-src https://*.apple.com https://*.music.apple.com; frame-src https://*.apple.com https://*.music.apple.com; style-src 'self' 'unsafe-inline';"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in to Apple Music</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        font-family: system-ui, -apple-system, sans-serif;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        padding: 1.5rem;
+        box-sizing: border-box;
+        text-align: center;
+      }
+      #status {
+        font-size: 0.95rem;
+        opacity: 0.8;
+        min-height: 1.2em;
+      }
+      button {
+        font: inherit;
+        padding: 0.5rem 1rem;
+        border-radius: 0.5rem;
+        border: 1px solid currentColor;
+        background: transparent;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Apple Music</h1>
+    <p id="status">Preparing sign-in&hellip;</p>
+    <button id="signin" disabled>Sign in</button>
+    <button id="cancel">Cancel</button>
+
+    <!--
+      The MusicKit JS library is loaded from Apple's CDN. The authorize() flow
+      navigates the user through Apple's hosted sign-in, then resolves with a
+      Music_User_Token which we hand back to the main process over the preload
+      bridge. This script only runs the authorize flow; it never persists or
+      logs the token.
+    -->
+    <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" async></script>
+    <script src="./sign-in.js"></script>
+  </body>
+</html>
