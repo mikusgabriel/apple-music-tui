@@ -406,7 +406,11 @@ class PlayerWindow {
 function createElectronPlayerWindow() {
   // Required lazily so unit tests that inject a fake window never load Electron.
   const { BrowserWindow, ipcMain } = require('electron');
-  const { COMMAND_CHANNEL, EVENT_CHANNEL } = require('./player-preload');
+  // The channel names must match player-preload.js. They are defined here rather
+  // than required from the preload, because the preload calls contextBridge,
+  // which only exists in the renderer and throws in the main process.
+  const COMMAND_CHANNEL = 'player:command';
+  const EVENT_CHANNEL = 'player:event';
 
   const win = new BrowserWindow({
     show: false,

@@ -55,7 +55,7 @@ use tokio::process::{Child, Command};
 /// it, before giving up and continuing without an engine connection. The engine
 /// binds the socket asynchronously during Electron startup, so we poll
 /// [`IpcClient::connect`] until it succeeds or this budget elapses.
-const ENGINE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const ENGINE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Delay between connection attempts while the engine is still starting up.
 const ENGINE_CONNECT_RETRY: Duration = Duration::from_millis(100);
