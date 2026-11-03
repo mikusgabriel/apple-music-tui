@@ -42,13 +42,20 @@ use std::time::{Duration, Instant};
 
 use apple_music_tui::auth::AuthManager;
 use apple_music_tui::config::{self, Configuration};
-use apple_music_tui::ipc::{IpcClient, IpcSender, Notification, RequestMethod};
+use apple_music_tui::api::{
+    validate_query, CatalogApi, LibraryList, LibraryRequest, SearchPagination, SectionMore,
+};
+use apple_music_tui::ipc::{
+    resolve_socket_path, IpcClient, IpcSender, Notification, RequestMethod, SignInStatus,
+};
 use apple_music_tui::keybindings::{self, Resolution};
 use apple_music_tui::mpris::{self, MprisAdapter, RegistrationOutcome, SharedState};
 use apple_music_tui::preview::{EngineErrorState, EngineFailure};
 use apple_music_tui::session;
-use apple_music_tui::token_store::TokenStore;
-use apple_music_tui::ui::{self, App, KeybindingActionResolver, LoopOutcome, TerminalGuard};
+use apple_music_tui::token_store::{SecretString, TokenStore};
+use apple_music_tui::ui::{
+    self, App, FetchOutcome, FetchRequest, KeybindingActionResolver, LoopOutcome, TerminalGuard,
+};
 use tokio::process::{Child, Command};
 
 /// How long to wait for the Playback_Engine to bind its socket after we spawn
@@ -165,6 +172,26 @@ async fn run(config: Configuration) -> std::io::Result<LoopOutcome> {
     let has_music_user_token = auth.has_music_user_token();
 
     let mut app = App::new(restored.state);
+    // Fetch the Developer_Token up front so the engine player can authorize DRM
+    // playback (MusicKit.configure needs it). A failure is non-fatal here: it is
+    // logged token-free and playback will surface a DRM/auth error until a token
+    // is available; catalog/library fetches fetch their own token as needed.
+    let startup_developer_token = match auth.developer_token().await {
+        Ok(token) => Some(token.expose().to_string()),
+        Err(err) => {
+            ui::log_unrecoverable(&format!("could not obtain Developer_Token at startup: {err}"));
+            None
+        }
+    };
+    // Supply the dispatch-time configuration: the seek step (Requirement 4.6),
+    // the stored Music_User_Token so transport actions can authorize engine
+    // `load` requests right away for a returning user (Requirements 1.2, 1.6),
+    // and the Developer_Token the engine player needs for DRM playback.
+    app.configure(
+        config.seek_step_seconds,
+        auth.music_user_token().map(|t| t.expose().to_string()),
+        startup_developer_token,
+    );
 
     // 4. Spawn and connect the Playback_Engine. On a failure to spawn/connect
     //    (the engine binary is absent or Widevine/Chromium is unavailable) the
@@ -190,7 +217,7 @@ async fn run(config: Configuration) -> std::io::Result<LoopOutcome> {
             // Requirement 1.1: no Music_User_Token — open the Sign_In_Window
             // within 3 seconds of startup, passing the Developer_Token the
             // window needs to run the MusicKit sign-in flow.
-            open_sign_in(&startup.sender, &auth).await;
+            open_sign_in(&startup.sender, &auth, &config.storefront).await;
         }
     }
 
@@ -246,6 +273,52 @@ async fn run(config: Configuration) -> std::io::Result<LoopOutcome> {
         async move { restart_engine(error, restart_auth, restart_state).await }
     };
 
+    // Poll the shared state for a Music_User_Token captured by a mid-session
+    // sign-in (set by the notification pump on a successful `signInResult`) so
+    // the render loop can authorize engine `load` requests after the user signs
+    // in (Requirements 1.3, 1.6). A `try_lock` keeps the tick non-blocking;
+    // the token is taken once so it is handed over exactly once, and persisted
+    // to the Token_Store so the user stays signed in across launches
+    // (Requirement 1.3). A save failure is logged (token-free) and does not
+    // disturb the in-memory token used for this session (Requirement 1.15).
+    let token_state = mpris_state.clone();
+    let token_auth = &auth;
+    let token_watch = move || {
+        let token = match token_state.try_lock() {
+            Ok(mut guard) => guard.captured_music_user_token.take(),
+            Err(_) => None,
+        }?;
+        if let Err(err) = token_auth.store_music_user_token(&SecretString::new(token.clone())) {
+            ui::log_unrecoverable(&format!("failed to persist Music_User_Token: {err}"));
+        }
+        Some(token)
+    };
+
+    // The catalog/library API client, built once over a shared connection pool
+    // for the storefront in the config. The fetch closure runs search and
+    // library requests on the loop's behalf, attaching the Developer_Token and
+    // (for library) the Music_User_Token, and returns a view-ready outcome.
+    let catalog_api = CatalogApi::new(config.storefront.clone()).ok();
+    let catalog_api_ref = catalog_api.as_ref();
+    let fetch_auth = &auth;
+    let fetch = move |request: FetchRequest| async move {
+        match catalog_api_ref {
+            Some(api) => run_fetch(api, fetch_auth, request).await,
+            // No HTTP client could be built: surface a benign message.
+            None => match request {
+                FetchRequest::Search { .. } => {
+                    FetchOutcome::Search(Err("search is unavailable".to_string()))
+                }
+                FetchRequest::LibrarySection { .. } | FetchRequest::LibraryTracks { .. } => {
+                    FetchOutcome::Library {
+                        result: Err("the library could not be loaded".to_string()),
+                        is_track_list: matches!(request, FetchRequest::LibraryTracks { .. }),
+                    }
+                }
+            },
+        }
+    };
+
     let outcome = ui::run(
         &mut guard,
         &mut app,
@@ -253,6 +326,8 @@ async fn run(config: Configuration) -> std::io::Result<LoopOutcome> {
         engine_sender.as_ref(),
         on_restart,
         engine_watch,
+        token_watch,
+        fetch,
     )
     .await?;
 
@@ -296,6 +371,19 @@ struct EngineStartup {
 /// surface the engine start-failure error with a restart action. This task
 /// simply logs and continues without an engine connection.
 async fn start_engine() -> Option<EngineStartup> {
+    // A stale socket file can survive an unclean engine exit (the engine was
+    // SIGKILL/SIGTERM'd before it could unlink the socket, or a prior `cargo
+    // run` crashed). The freshly spawned engine unlinks a stale socket before
+    // binding, but there is a race: the TUI may `connect()` to the leftover
+    // socket file before the new engine rebinds, and connecting to a socket
+    // whose listener is gone fails with ENXIO ("No such device or address",
+    // os error 6). That makes the connect loop burn its whole budget against a
+    // dead socket, the TUI gives up, and the engine-driven sign-in never runs —
+    // so no Music_User_Token is ever captured or persisted and the user has to
+    // sign in on every launch. Clear the stale socket up front so the new
+    // engine always binds a fresh one and the connect loop targets it.
+    remove_stale_engine_socket().await;
+
     let child = match spawn_engine_process() {
         Ok(child) => child,
         Err(err) => {
@@ -321,6 +409,48 @@ async fn start_engine() -> Option<EngineStartup> {
                 "Playback_Engine did not accept a socket connection in time; continuing without it",
             );
             None
+        }
+    }
+}
+
+/// Remove a stale engine socket file left by an unclean engine exit.
+///
+/// The engine binds a Unix domain socket at [`resolve_socket_path`]. On a clean
+/// shutdown it unlinks that file, but a crash or a `SIGKILL`/`SIGTERM` (for
+/// example when a previous `cargo run` is interrupted) can leave the socket file
+/// behind with no process listening on it. Connecting to such a file fails with
+/// `ENXIO` ("No such device or address", os error 6), which is exactly the
+/// failure that makes [`start_engine`] time out and drop into preview-only mode
+/// — preventing the engine-driven sign-in and thus the one-time persistence of
+/// the Music_User_Token.
+///
+/// This probes the socket: if a connection succeeds, a live engine is already
+/// serving and the file is left untouched (the single-instance engine will
+/// handle it). If the file exists but the probe fails, the socket is stale and
+/// is unlinked so the freshly spawned engine can bind a clean one. A missing
+/// file is a no-op. Any unlink error is logged (token-free) and ignored; the
+/// engine's own pre-bind unlink is the backstop.
+async fn remove_stale_engine_socket() {
+    let path = resolve_socket_path();
+    // Nothing to clean up if the file is not present.
+    if !path.exists() {
+        return;
+    }
+    // If something is actively listening, a live engine owns the socket; leave
+    // it alone rather than yanking the path out from under a running engine.
+    if IpcClient::connect_to(&path).await.is_ok() {
+        return;
+    }
+    // The file exists but no listener accepted the connection: it is stale.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        // A concurrent cleanup (e.g. the engine's own pre-bind unlink) already
+        // removed it; that is fine.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            ui::log_unrecoverable(&format!(
+                "failed to remove stale Playback_Engine socket: {err}"
+            ));
         }
     }
 }
@@ -421,10 +551,19 @@ async fn restart_engine(
     // stored Music_User_Token to authorize the load.
     if let Some(load) = error.reconnect_load() {
         if let Some(token) = auth.music_user_token() {
+            // Fetch the Developer_Token so the reloaded track can authorize DRM
+            // playback; a fetch failure sends an empty token (engine reports a
+            // DRM/auth error rather than failing silently).
+            let developer_token = auth
+                .developer_token()
+                .await
+                .map(|t| t.expose().to_string())
+                .unwrap_or_default();
             let request = RequestMethod::Load {
                 track_id: load.track_id,
                 position_ms: load.position_ms,
                 music_user_token: token.expose().to_string(),
+                developer_token,
             };
             if let Err(err) = startup.sender.send(&request).await {
                 ui::log_unrecoverable(&format!(
@@ -449,7 +588,7 @@ async fn restart_engine(
 /// is logged (token-free) and sign-in is skipped; task 16.2/later wiring adds
 /// the user-facing web-player error with a retry action. The token value is
 /// passed straight to the engine request and never logged.
-async fn open_sign_in(sender: &IpcSender, auth: &AuthManager) {
+async fn open_sign_in(sender: &IpcSender, auth: &AuthManager, storefront: &str) {
     let developer_token = match auth.developer_token().await {
         Ok(token) => token,
         Err(err) => {
@@ -461,6 +600,7 @@ async fn open_sign_in(sender: &IpcSender, auth: &AuthManager) {
 
     let request = RequestMethod::OpenSignIn {
         developer_token: developer_token.expose().to_string(),
+        storefront: storefront.to_string(),
     };
     if let Err(err) = sender.send(&request).await {
         ui::log_unrecoverable(&format!("failed to open Sign_In_Window: {err}"));
@@ -519,27 +659,172 @@ fn spawn_notification_pump(mut client: IpcClient, state: SharedState) {
 }
 
 /// Apply one engine [`Notification`] to the shared [`mpris::MprisState`] so the
-/// mirrored Playback_State reflects the engine (Requirement 4.9).
+/// mirrored Playback_State reflects the engine (Requirement 4.9) and a captured
+/// Music_User_Token reaches the render loop (Requirements 1.3, 1.6).
 ///
-/// Only the state-bearing `stateChanged` notification updates the mirror here;
-/// the richer handling of trackFinished/playbackError/trackUnavailable/sign-in
-/// results (advancing the Queue, showing named errors, capturing the token) is
-/// owned by later transport/sign-in wiring. Keeping this focused avoids
-/// duplicating that logic before it exists.
+/// `stateChanged` updates the mirrored status/position/duration; a successful
+/// `signInResult` records the captured Music_User_Token into the shared state
+/// so the render loop can authorize engine `load` requests after the user signs
+/// in. The richer handling of trackFinished/playbackError/trackUnavailable is
+/// owned by later transport wiring.
 async fn apply_notification(state: &SharedState, notification: Notification) {
-    if let Notification::StateChanged {
-        status,
-        position_ms,
-        duration_ms,
-        ..
-    } = notification
-    {
-        let mut guard = state.lock().await;
-        guard.playback.status = status;
-        guard.playback.position_ms = position_ms;
-        if let Some(duration_ms) = duration_ms {
-            guard.playback.duration_ms = Some(duration_ms);
+    match notification {
+        Notification::StateChanged {
+            status,
+            position_ms,
+            duration_ms,
+            ..
+        } => {
+            let mut guard = state.lock().await;
+            guard.playback.status = status;
+            guard.playback.position_ms = position_ms;
+            if let Some(duration_ms) = duration_ms {
+                guard.playback.duration_ms = Some(duration_ms);
+            }
         }
+        // A successful sign-in carrying a non-empty token: hand it to the render
+        // loop via the shared state so post-login transport actions can
+        // authorize `load` (Requirements 1.3, 1.6). The token value is stored in
+        // memory only here and is never logged.
+        Notification::SignInResult {
+            status: SignInStatus::Ok,
+            music_user_token: Some(token),
+        } if !token.trim().is_empty() => {
+            state.lock().await.captured_music_user_token = Some(token);
+        }
+        // A sign-in reported "ok" but with an empty/absent token: this is not a
+        // usable sign-in, so nothing is captured and the user stays signed out.
+        // Log it (token-free) so a silent "ok but no token" is diagnosable
+        // rather than looking like a mysterious "sign in again" later.
+        Notification::SignInResult {
+            status: SignInStatus::Ok,
+            ..
+        } => {
+            ui::log_unrecoverable(
+                "sign-in reported success but carried no Music_User_Token; staying signed out",
+            );
+        }
+        // The user dismissed the sign-in window without completing it. Recorded
+        // so the library's "you must sign in again" message is explained.
+        Notification::SignInResult {
+            status: SignInStatus::Cancelled,
+            ..
+        } => {
+            ui::log_unrecoverable("sign-in was cancelled; no Music_User_Token captured");
+        }
+        // The sign-in flow errored (window failed to open, MusicKit JS did not
+        // load, or authorize() threw). The reason is already token-free.
+        Notification::SignInError { reason } => {
+            ui::log_unrecoverable(&format!("sign-in failed: {reason}"));
+        }
+        _ => {}
+    }
+}
+
+/// Run a single [`FetchRequest`] against the catalog/library API, returning a
+/// view-ready [`FetchOutcome`] (Requirements 2, 3).
+///
+/// Obtains the Developer_Token (fetching/refreshing as needed) and attaches the
+/// stored Music_User_Token where required. Errors are mapped to token-free
+/// user-facing messages; token values are never included.
+async fn run_fetch(
+    api: &CatalogApi,
+    auth: &AuthManager,
+    request: FetchRequest,
+) -> FetchOutcome {
+    // The Developer_Token is needed for every request; a fetch failure becomes a
+    // user-facing message (token-free).
+    let developer_token = match auth.developer_token().await {
+        Ok(token) => token,
+        Err(err) => {
+            let message = format!("could not reach Apple Music: {err}");
+            return match request {
+                FetchRequest::Search { .. } => FetchOutcome::Search(Err(message)),
+                FetchRequest::LibrarySection { .. } | FetchRequest::LibraryTracks { .. } => {
+                    FetchOutcome::Library {
+                        result: Err("the library could not be loaded".to_string()),
+                        is_track_list: matches!(request, FetchRequest::LibraryTracks { .. }),
+                    }
+                }
+            };
+        }
+    };
+    let music_user_token = auth.music_user_token();
+
+    match request {
+        FetchRequest::Search { query } => {
+            // Validate once so we can both build the request (for pagination) and
+            // report an invalid-query message without sending anything.
+            let valid = match validate_query(&query) {
+                Ok(valid) => valid,
+                Err(err) => return FetchOutcome::Search(Err(err.to_string())),
+            };
+            let search_request = api.request_for(&valid);
+            match api
+                .search(&query, &developer_token, music_user_token.as_ref())
+                .await
+            {
+                Ok((results, _dropped)) => {
+                    // The first page carries no load-more markers here; further
+                    // pages are a later enhancement. Capped results still show.
+                    let pagination =
+                        SearchPagination::new(&search_request, results, SectionMore::default());
+                    FetchOutcome::Search(Ok(pagination))
+                }
+                Err(err) => FetchOutcome::Search(Err(err.to_string())),
+            }
+        }
+        FetchRequest::LibrarySection { section } => {
+            fetch_library_list(api, &developer_token, music_user_token.as_ref(), LibraryRequest::section(section, 0), false).await
+        }
+        FetchRequest::LibraryTracks { kind, id } => {
+            fetch_library_list(
+                api,
+                &developer_token,
+                music_user_token.as_ref(),
+                LibraryRequest::tracks(kind, &id, 0),
+                true,
+            )
+            .await
+        }
+    }
+}
+
+/// Fetch the first page of a library list and wrap it as a [`FetchOutcome`].
+///
+/// A missing Music_User_Token or a rejected token both surface as a token-free
+/// library error; a transport/status error does the same (Requirement 3.7/3.9).
+async fn fetch_library_list(
+    api: &CatalogApi,
+    developer_token: &SecretString,
+    music_user_token: Option<&SecretString>,
+    request: LibraryRequest,
+    is_track_list: bool,
+) -> FetchOutcome {
+    let Some(music_user_token) = music_user_token else {
+        return FetchOutcome::Library {
+            result: Err("you must sign in again".to_string()),
+            is_track_list,
+        };
+    };
+    match api
+        .fetch_library(&request, developer_token, music_user_token)
+        .await
+    {
+        Ok(page) => {
+            let mut list = LibraryList::new(request);
+            // Seed the first page through the state machine so items display.
+            let _ = list.first_page_request();
+            list.apply_page(page);
+            FetchOutcome::Library {
+                result: Ok(list),
+                is_track_list,
+            }
+        }
+        Err(err) => FetchOutcome::Library {
+            result: Err(err.message()),
+            is_track_list,
+        },
     }
 }
 

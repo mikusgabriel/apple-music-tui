@@ -13,12 +13,15 @@
 
 'use strict';
 
-const { app } = require('electron');
+const { app, session, components } = require('electron');
+const path = require('path');
 
 const { IpcServer } = require('./ipc-server');
 const { PlayerWindow } = require('./player-window');
 const { SignInWindow } = require('./sign-in-window');
 const { ParentWatcher } = require('./parent-watcher');
+const { AssetServer } = require('./asset-server');
+const { installOriginHeaders } = require('./origin-headers');
 
 // ---------------------------------------------------------------------------
 // Reduced-feature launch flags (Requirement 10.3, design "Technology Stack").
@@ -57,6 +60,15 @@ applyLaunchFlags();
 // than racing over the same Unix socket.
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
+  // Another engine instance already holds the lock. This is the expected guard
+  // against racing two engines over one socket — but if that other instance is
+  // a stale orphan, the parent TUI that just spawned us will never connect and
+  // degrades to preview-only. Log loudly so the cause is diagnosable, then exit.
+  console.error(
+    '[engine] another Playback_Engine instance already holds the single-instance ' +
+      'lock; exiting. If the TUI reports "did not accept a socket connection in ' +
+      'time", a stale engine from a previous run may be lingering.'
+  );
   app.quit();
 }
 
@@ -66,6 +78,7 @@ let ipcServer = null;
 let playerWindow = null;
 let signInWindow = null;
 let parentWatcher = null;
+let assetServer = null;
 
 /**
  * Terminate the engine and all of its child processes (Requirement 10.7).
@@ -86,6 +99,9 @@ function terminateEngine() {
     if (signInWindow && typeof signInWindow.close === 'function') {
       signInWindow.close();
     }
+    if (assetServer) {
+      assetServer.stop();
+    }
   } catch (err) {
     console.error('[engine] error during termination cleanup:', err && err.message ? err.message : err);
   }
@@ -95,13 +111,13 @@ function terminateEngine() {
   app.exit(0);
 }
 
-// Bind the IPC socket immediately instead of inside app.whenReady(). The socket
-// server is plain Node and needs nothing from Chromium, while whenReady() only
-// resolves after full Electron init, which on a cold start can take longer than
-// the TUI parent waits to connect. The hidden player window still needs Electron,
-// so it is created in whenReady below; PlayerWindow.create() is lazy, so a load
-// request that arrives first is handled once the window exists.
-function startIpcServer() {
+// Bind the IPC socket shortly after startup. The socket server is plain Node
+// and needs nothing from Chromium, while whenReady() only resolves after full
+// Electron init. The hidden player window and the https origin interceptor both
+// need Electron, so the header rewriter is installed in whenReady below. The
+// loopback asset server is plain Node and is started here so the sign-in URL is
+// set before the IPC socket accepts requests.
+async function startIpcServer() {
   playerWindow = new PlayerWindow({
     notify: (method, params) => {
       if (ipcServer) ipcServer.notify(method, params);
@@ -118,6 +134,40 @@ function startIpcServer() {
     onClientDisconnected: () => parentWatcher.setIpcConnected(false),
   });
 
+  // Forward the Sign_In_Window's completion/error to the TUI as the
+  // `signInResult` / `signInError` notifications. The window was constructed
+  // before `ipcServer` existed, so its callbacks are wired here via
+  // `setCallbacks`. Without this, a captured Music_User_Token is dropped on the
+  // floor (the window's default callbacks are no-ops) and the TUI never learns
+  // the user signed in — so it asks the user to sign in on every launch.
+  signInWindow.setCallbacks({
+    onResult: (payload) => {
+      if (ipcServer) ipcServer.notify('signInResult', payload);
+    },
+    onError: (payload) => {
+      if (ipcServer) ipcServer.notify('signInError', payload);
+    },
+  });
+
+  // Serve the sign-in assets over a loopback HTTP origin (the page must not run
+  // on a `file://` origin, which MusicKit rejects). We do NOT hijack the https
+  // scheme — that breaks Apple's authorize popup. The Developer_Token's origin
+  // requirement is satisfied separately by rewriting the Origin header on Apple
+  // API calls (see origin-headers.js, installed in whenReady). Start the server
+  // and set the URL before binding the IPC socket so no openSignIn is handled
+  // before the window knows its URL.
+  assetServer = new AssetServer({ root: path.join(__dirname, 'sign-in') });
+  try {
+    await assetServer.start();
+    signInWindow.setSignInUrl(assetServer.signInUrl());
+    console.error('[engine] sign-in asset server ready at', assetServer.baseUrl());
+  } catch (err) {
+    console.error(
+      '[engine] failed to start sign-in asset server:',
+      err && err.message ? err.message : err
+    );
+  }
+
   ipcServer.start();
   parentWatcher.start();
 }
@@ -127,7 +177,52 @@ function startIpcServer() {
 if (gotSingleInstanceLock) {
   startIpcServer();
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
+    // Rewrite the Origin/Referer headers on Apple Music API requests to
+    // `https://music.apple.com` — the origin the web-player Developer_Token is
+    // bound to (`root_https_origin: ["apple.com"]`). Without this, MusicKit's
+    // post-authorize `GET /v1/me/storefront` (and catalog calls) are rejected
+    // with 401/403, surfacing as "Storefront Country Code error." /
+    // "Unauthorized". This is scoped to the API hosts, so Apple's authorize
+    // popup and its postMessage handshake are untouched. Requires whenReady().
+    try {
+      installOriginHeaders({ session: session.defaultSession });
+      console.error('[engine] Apple API origin-header rewrite installed');
+    } catch (err) {
+      console.error(
+        '[engine] failed to install origin-header rewrite:',
+        err && err.message ? err.message : err
+      );
+    }
+
+    // Wait for the Widevine CDM to be installed/ready before creating the
+    // player window. Apple Music streams are Widevine-DRM-encrypted; without the
+    // CDM the audio element cannot decode and playback is silent even though
+    // MusicKit reports "playing". castLabs ECS installs the CDM via the
+    // component updater on first launch; `components.whenReady()` resolves once
+    // it is available (subsequent launches resolve immediately). This is why the
+    // engine depends on castLabs electron-releases rather than stock Electron.
+    if (components && typeof components.whenReady === 'function') {
+      try {
+        await components.whenReady();
+        console.error(
+          '[engine] Widevine components ready:',
+          typeof components.status === 'function' ? JSON.stringify(components.status()) : '(status n/a)'
+        );
+      } catch (err) {
+        // Without Widevine, DRM playback will fail; log and continue so the
+        // engine still serves sign-in and preview-mode fallbacks.
+        console.error(
+          '[engine] Widevine components failed to initialize:',
+          err && err.message ? err.message : err
+        );
+      }
+    } else {
+      console.error(
+        '[engine] WARNING: components API unavailable — this is not a Widevine-enabled Electron; DRM playback will be silent'
+      );
+    }
+
     playerWindow.create();
   });
 }
@@ -149,6 +244,9 @@ app.on('before-quit', () => {
   }
   if (ipcServer) {
     ipcServer.stop();
+  }
+  if (assetServer) {
+    assetServer.stop();
   }
 });
 

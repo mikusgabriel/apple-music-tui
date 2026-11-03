@@ -555,6 +555,24 @@ impl<C: Clock> AuthManager<C> {
         self.music_user_token().is_some()
     }
 
+    /// Persist a Music_User_Token captured by the Sign_In_Window so the user
+    /// stays signed in across launches (Requirements 1.3, 1.6, 1.15).
+    ///
+    /// Best-effort by contract: the returned result lets the caller surface a
+    /// save-failure warning, but a failure does not invalidate the in-memory
+    /// token for the current session (Requirement 1.15). An empty token is
+    /// rejected rather than stored, so a spurious empty `signInResult` cannot
+    /// clobber a good stored token.
+    pub fn store_music_user_token(
+        &self,
+        token: &SecretString,
+    ) -> Result<(), TokenStoreError> {
+        if token.is_empty() {
+            return Ok(());
+        }
+        self.store.save(TokenKind::MusicUser, token)
+    }
+
     /// Delete the Music_User_Token on sign-out while keeping the cached
     /// Developer_Token (Requirement 1.12).
     ///
@@ -1017,6 +1035,42 @@ mod tests {
 
         assert!(!manager.has_music_user_token());
         assert!(manager.music_user_token().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_music_user_token_persists_for_next_launch() {
+        // A captured sign-in token is persisted so a later AuthManager (a fresh
+        // launch) sees it and skips the Sign_In_Window (Requirements 1.3, 1.6).
+        let (store, dir) = temp_store("mut-store");
+        let manager = AuthManager::new(store);
+        assert!(!manager.has_music_user_token());
+
+        manager
+            .store_music_user_token(&SecretString::new("captured-token"))
+            .expect("save succeeds");
+
+        // Simulate a fresh launch pointing at the same data dir.
+        let next_launch = AuthManager::new(TokenStore::with_file_dir(&dir));
+        assert!(next_launch.has_music_user_token());
+        assert_eq!(
+            next_launch.music_user_token().map(|t| t.expose().to_string()),
+            Some("captured-token".to_string())
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_empty_music_user_token_is_ignored() {
+        // An empty token must not clobber state or be stored (Requirement 1.1).
+        let (store, dir) = temp_store("mut-store-empty");
+        let manager = AuthManager::new(store);
+        manager
+            .store_music_user_token(&SecretString::new(""))
+            .expect("empty save is a no-op success");
+        assert!(!manager.has_music_user_token());
 
         std::fs::remove_dir_all(&dir).ok();
     }

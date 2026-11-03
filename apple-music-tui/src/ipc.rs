@@ -135,7 +135,7 @@ impl FrameDecoder {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RequestParams {
-    /// `load` — `{trackId, positionMs, musicUserToken}`.
+    /// `load` — `{trackId, positionMs, musicUserToken, developerToken}`.
     Load {
         #[serde(rename = "trackId")]
         track_id: String,
@@ -143,6 +143,8 @@ pub enum RequestParams {
         position_ms: u64,
         #[serde(rename = "musicUserToken")]
         music_user_token: String,
+        #[serde(rename = "developerToken")]
+        developer_token: String,
     },
     /// `seek` — `{positionMs}`.
     Seek {
@@ -151,10 +153,12 @@ pub enum RequestParams {
     },
     /// `setVolume` — `{level}`.
     SetVolume { level: u8 },
-    /// `openSignIn` — `{developerToken}`.
+    /// `openSignIn` — `{developerToken, storefrontId}`.
     OpenSignIn {
         #[serde(rename = "developerToken")]
         developer_token: String,
+        #[serde(rename = "storefrontId")]
+        storefront: String,
     },
     /// Methods with no parameters: `play`, `pause`, `closeSignIn`, `shutdown`.
     Empty {},
@@ -164,10 +168,13 @@ pub enum RequestParams {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestMethod {
     /// Load a track at a start position, authorizing with the Music_User_Token.
+    /// Carries the Developer_Token so the player's MusicKit.configure can
+    /// authorize full-length DRM streams.
     Load {
         track_id: String,
         position_ms: u64,
         music_user_token: String,
+        developer_token: String,
     },
     /// Resume playback.
     Play,
@@ -177,8 +184,12 @@ pub enum RequestMethod {
     Seek { position_ms: u64 },
     /// Set the volume level (clamped 0–100 by the engine).
     SetVolume { level: u8 },
-    /// Open the Sign_In_Window, passing the Developer_Token.
-    OpenSignIn { developer_token: String },
+    /// Open the Sign_In_Window, passing the Developer_Token and the storefront
+    /// country code MusicKit needs to resolve the account's storefront.
+    OpenSignIn {
+        developer_token: String,
+        storefront: String,
+    },
     /// Close the Sign_In_Window.
     CloseSignIn,
     /// Ask the engine to shut down.
@@ -207,17 +218,23 @@ impl RequestMethod {
                 track_id,
                 position_ms,
                 music_user_token,
+                developer_token,
             } => RequestParams::Load {
                 track_id: track_id.clone(),
                 position_ms: *position_ms,
                 music_user_token: music_user_token.clone(),
+                developer_token: developer_token.clone(),
             },
             RequestMethod::Seek { position_ms } => RequestParams::Seek {
                 position_ms: *position_ms,
             },
             RequestMethod::SetVolume { level } => RequestParams::SetVolume { level: *level },
-            RequestMethod::OpenSignIn { developer_token } => RequestParams::OpenSignIn {
+            RequestMethod::OpenSignIn {
+                developer_token,
+                storefront,
+            } => RequestParams::OpenSignIn {
                 developer_token: developer_token.clone(),
+                storefront: storefront.clone(),
             },
             RequestMethod::Play
             | RequestMethod::Pause
@@ -603,6 +620,7 @@ mod tests {
             track_id: "123".to_string(),
             position_ms: 5000,
             music_user_token: "mut".to_string(),
+            developer_token: "dev".to_string(),
         };
         let request = Request::new(7, &method);
         let value: Value = serde_json::to_value(&request).unwrap();
@@ -612,6 +630,7 @@ mod tests {
         assert_eq!(value["params"]["trackId"], "123");
         assert_eq!(value["params"]["positionMs"], 5000);
         assert_eq!(value["params"]["musicUserToken"], "mut");
+        assert_eq!(value["params"]["developerToken"], "dev");
     }
 
     #[test]
@@ -644,11 +663,13 @@ mod tests {
             3,
             &RequestMethod::OpenSignIn {
                 developer_token: "dev".to_string(),
+                storefront: "us".to_string(),
             },
         ))
         .unwrap();
         assert_eq!(sign_in["method"], "openSignIn");
         assert_eq!(sign_in["params"]["developerToken"], "dev");
+        assert_eq!(sign_in["params"]["storefrontId"], "us");
     }
 
     #[test]

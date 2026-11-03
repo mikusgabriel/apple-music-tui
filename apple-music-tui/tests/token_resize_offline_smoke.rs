@@ -741,7 +741,9 @@ fn input_latency_under_unreachable_network_within_budget() {
         let start = Instant::now();
         match resolver.resolve(app.view, key) {
             Action::Switch(view) => app.switch_view(view),
-            Action::Quit | Action::Ignored => {}
+            // The keys exercised here only switch views; any other resolved
+            // action is a no-op for this latency check.
+            _ => {}
         }
         let (render_elapsed, fit) = draw_at(&app, 100, 30);
         let elapsed = start.elapsed();

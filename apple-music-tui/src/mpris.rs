@@ -364,6 +364,12 @@ pub struct MprisState {
     /// engine error with a restart action, without the background pump needing
     /// direct access to the UI state.
     pub engine_lost: bool,
+    /// Set by the notification pump when a `signInResult` carries a non-empty
+    /// Music_User_Token (Requirements 1.3, 1.6). The render loop picks it up on
+    /// the next tick so post-login actions can authorize engine `load`
+    /// requests, without the background pump needing direct access to the UI
+    /// state. `None` until a successful sign-in is observed.
+    pub captured_music_user_token: Option<String>,
 }
 
 /// Shared handle to [`MprisState`], cloned into the zbus interface objects and
@@ -453,6 +459,7 @@ impl InterfaceContext {
                             track_id: t.track_id.clone(),
                             position_ms: 0,
                             music_user_token: String::new(),
+                            developer_token: String::new(),
                         })
                     };
                     if let Some(load) = load {

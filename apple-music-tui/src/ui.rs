@@ -48,12 +48,12 @@ use ratatui::{Frame, Terminal};
 use crate::api::{
     LibraryList, LibrarySection, SearchPagination, SearchResults, SearchSection,
 };
-use crate::domain::Domain_Object;
+use crate::domain::{Domain_Object, PlaybackStatus};
 use crate::ipc::{IpcSender, RequestMethod};
-use crate::keybindings::{self, Resolution};
+use crate::keybindings::{self, Resolution, TextInputField, TextInputOutcome};
 use crate::now_playing::{self, format_duration, Playback_State};
 use crate::preview::{self, EngineErrorState};
-use crate::queue::{Queue, QueueFullError, QueueTrack, RemoveCurrentOutcome};
+use crate::queue::{self, Queue, QueueFullError, QueueTrack, RemoveCurrentOutcome};
 use crate::session::{self, SerializedQueue, SerializedTrack, Session_State};
 
 /// The application log file name under the state directory (Requirements 7.9,
@@ -93,10 +93,10 @@ impl View {
 
 /// A resolved action produced from a key event.
 ///
-/// This task only needs the lifecycle-relevant actions; the full action set is
-/// owned by the Keybinding resolver (task 14.1). Keeping this enum small and
-/// local gives task 14.1 a clear integration seam: it can implement
-/// [`ActionResolver`] and return richer actions without this module changing.
+/// This is the full set of actions the render/input loop dispatches. The
+/// Keybinding resolver ([`KeybindingActionResolver`]) maps every
+/// [`keybindings::Action`] onto one of these so the loop can act on transport,
+/// navigation, Queue editing, help, and sign-out — not just the lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// Quit the application (default `q`): save session, stop playback,
@@ -104,26 +104,87 @@ pub enum Action {
     Quit,
     /// Switch to a specific view.
     Switch(View),
-    /// A key that this task does not act on. Later tasks (13.2/13.3/14.1) give
-    /// these meaning; here they are simply ignored.
+    /// Toggle the help overlay (Requirement 7.3).
+    ToggleHelp,
+    /// Sign out of the current Apple ID session (Requirement 1.12).
+    SignOut,
+    /// Move the selection down one item in the active view (Requirement 7.2).
+    NavDown,
+    /// Move the selection up one item in the active view (Requirement 7.2).
+    NavUp,
+    /// Open/activate the selected item in the active view (Requirement 7.2).
+    NavOpen,
+    /// Return from a drilled-in list to the previous level (Requirement 7.2).
+    NavBack,
+    /// Toggle play/pause (Requirement 4.2).
+    PlayPause,
+    /// Skip to the next track (Requirement 4.3).
+    NextTrack,
+    /// Skip to the previous track (Requirements 4.4, 4.5).
+    PreviousTrack,
+    /// Seek forward by the configured step (Requirement 4.6).
+    SeekForward,
+    /// Seek backward by the configured step (Requirement 4.6).
+    SeekBackward,
+    /// Raise the volume (Requirement 4.7).
+    VolumeUp,
+    /// Lower the volume (Requirement 4.7).
+    VolumeDown,
+    /// Toggle shuffle mode (Requirements 5.6, 5.7).
+    ToggleShuffle,
+    /// Cycle the repeat mode off → all → one (Requirement 5.8).
+    CycleRepeat,
+    /// Refresh the current Library section (Requirement 3.6).
+    RefreshLibrary,
+    /// Insert the selected track directly after the current track (Req 5.2).
+    PlayNext,
+    /// Append the selected track to the end of the Queue (Requirement 5.3).
+    AddToQueue,
+    /// Remove the selected track from the Queue (Requirements 5.4, 5.11).
+    RemoveFromQueue,
+    /// Move the selected Queue track up one position (Requirement 5.5).
+    MoveUp,
+    /// Move the selected Queue track down one position (Requirement 5.5).
+    MoveDown,
+    /// A key that resolves to no action in the current view; ignored.
     Ignored,
 }
 
 /// Resolves a key event to an [`Action`].
 ///
-/// Task 14.1 implements the real Keybinding resolver (defaults overlaid with
-/// config, conflict/unknown warnings, text-input focus handling). Until then,
-/// [`DefaultActionResolver`] provides the minimal built-in bindings this task
-/// needs to exercise the lifecycle. The loop depends only on this trait, so
-/// swapping in the real resolver requires no change here.
+/// The loop depends only on this trait, so the minimal built-in resolver
+/// ([`DefaultActionResolver`]) and the production Keybinding resolver
+/// ([`KeybindingActionResolver`]) are interchangeable. [`resolve`] handles a
+/// single key press; [`resolve_chord`] additionally threads a pending first key
+/// so two-key sequences (e.g. the default `g l` / `g q` / `g o`) resolve.
 pub trait ActionResolver {
-    /// Map a key event in the given view to an [`Action`].
+    /// Map a single key event in the given view to an [`Action`].
     fn resolve(&self, view: View, key: KeyEvent) -> Action;
+
+    /// Map a key press that may be part of a two-key chord to a [`ChordAction`].
+    ///
+    /// `pending` is the previously held first key of a potential chord, or
+    /// `None` for a fresh press. The default implementation ignores chords and
+    /// defers to [`resolve`], which is sufficient for the built-in resolver.
+    fn resolve_chord(&self, view: View, pending: Option<KeyEvent>, key: KeyEvent) -> ChordAction {
+        let _ = pending;
+        ChordAction::Resolved(self.resolve(view, key))
+    }
 }
 
-/// Minimal built-in resolver used until the Keybinding resolver (task 14.1)
-/// lands. Provides the default quit key (`q` and Ctrl-C) and simple view
-/// switching so the loop and its lifecycle can be exercised.
+/// The outcome of resolving one key press through [`ActionResolver::resolve_chord`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChordAction {
+    /// A binding fired (single key or a completed two-key chord).
+    Resolved(Action),
+    /// The key is the first key of a two-key binding; hold it and wait for the
+    /// next press.
+    Pending,
+}
+
+/// Minimal built-in resolver. Provides the default quit key (`q` and Ctrl-C),
+/// number/Tab view switching, and the vi/arrow navigation keys so the loop and
+/// its lifecycle can be exercised without the full Config_File resolver.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultActionResolver;
 
@@ -141,22 +202,23 @@ impl ActionResolver for DefaultActionResolver {
             KeyCode::Char('2') => Action::Switch(View::Library),
             KeyCode::Char('3') => Action::Switch(View::Queue),
             KeyCode::Tab => Action::Switch(View::Queue),
+            KeyCode::Char('j') | KeyCode::Down => Action::NavDown,
+            KeyCode::Char('k') | KeyCode::Up => Action::NavUp,
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => Action::NavOpen,
+            KeyCode::Char('h') | KeyCode::Left => Action::NavBack,
             _ => Action::Ignored,
         }
     }
 }
 
 /// The real [`ActionResolver`], backed by the resolved Keybinding map from the
-/// Config_File (task 14.1's [`keybindings::resolve_keybindings`]).
+/// Config_File ([`keybindings::resolve_keybindings`]).
 ///
-/// This is the production resolver wired in at startup (task 16.1): it maps a
-/// key press through the resolved bindings to a [`keybindings::Action`] and
-/// translates the lifecycle-relevant actions into this module's small
-/// [`Action`] set that the running loop acts on — `Quit` and the view switches
-/// (`Search`/`Library`/`Queue`). Every other resolved action (transport, queue
-/// edits, help, …) is reported as [`Action::Ignored`] here: the loop's job in
-/// this task is the startup/shutdown lifecycle and view navigation, so those
-/// actions are recognized by the resolver but not yet dispatched by the loop.
+/// It maps a key press through the resolved bindings to a
+/// [`keybindings::Action`] and translates the full action set into this
+/// module's [`Action`] enum, which the running loop dispatches: view switches,
+/// transport, navigation, Queue editing, help, and sign-out. Two-key sequences
+/// are resolved through [`resolve_chord`].
 ///
 /// Ctrl-C is honored as a quit regardless of the configured bindings so a quit
 /// always runs the clean shutdown sequence even if the user rebinds `quit`.
@@ -177,6 +239,37 @@ impl KeybindingActionResolver {
     }
 }
 
+/// Translate a resolved [`keybindings::Action`] into the loop's [`Action`].
+fn translate_action(action: keybindings::Action) -> Action {
+    match action {
+        keybindings::Action::Quit => Action::Quit,
+        keybindings::Action::Help => Action::ToggleHelp,
+        keybindings::Action::Search => Action::Switch(View::Search),
+        keybindings::Action::OpenLibrary => Action::Switch(View::Library),
+        keybindings::Action::OpenQueue => Action::Switch(View::Queue),
+        keybindings::Action::SignOut => Action::SignOut,
+        keybindings::Action::NavDown => Action::NavDown,
+        keybindings::Action::NavUp => Action::NavUp,
+        keybindings::Action::NavOpen => Action::NavOpen,
+        keybindings::Action::NavBack => Action::NavBack,
+        keybindings::Action::PlayPause => Action::PlayPause,
+        keybindings::Action::NextTrack => Action::NextTrack,
+        keybindings::Action::PreviousTrack => Action::PreviousTrack,
+        keybindings::Action::SeekForward => Action::SeekForward,
+        keybindings::Action::SeekBackward => Action::SeekBackward,
+        keybindings::Action::VolumeUp => Action::VolumeUp,
+        keybindings::Action::VolumeDown => Action::VolumeDown,
+        keybindings::Action::ToggleShuffle => Action::ToggleShuffle,
+        keybindings::Action::CycleRepeat => Action::CycleRepeat,
+        keybindings::Action::RefreshLibrary => Action::RefreshLibrary,
+        keybindings::Action::PlayNext => Action::PlayNext,
+        keybindings::Action::AddToQueue => Action::AddToQueue,
+        keybindings::Action::RemoveFromQueue => Action::RemoveFromQueue,
+        keybindings::Action::MoveUp => Action::MoveUp,
+        keybindings::Action::MoveDown => Action::MoveDown,
+    }
+}
+
 impl ActionResolver for KeybindingActionResolver {
     fn resolve(&self, view: View, key: KeyEvent) -> Action {
         // Ctrl-C always quits cleanly, independent of config, so the shutdown
@@ -184,18 +277,27 @@ impl ActionResolver for KeybindingActionResolver {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
+        match self.resolution.action_for_key(keybindings_view(view), key) {
+            Some(action) => translate_action(action),
+            None => Action::Ignored,
+        }
+    }
 
+    fn resolve_chord(&self, view: View, pending: Option<KeyEvent>, key: KeyEvent) -> ChordAction {
+        // Ctrl-C always quits cleanly, independent of config or any pending
+        // chord prefix.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return ChordAction::Resolved(Action::Quit);
+        }
         match self
             .resolution
-            .action_for_key(keybindings_view(view), key)
+            .resolve_chord(keybindings_view(view), pending, key)
         {
-            Some(keybindings::Action::Quit) => Action::Quit,
-            Some(keybindings::Action::Search) => Action::Switch(View::Search),
-            Some(keybindings::Action::OpenLibrary) => Action::Switch(View::Library),
-            Some(keybindings::Action::OpenQueue) => Action::Switch(View::Queue),
-            // Recognized but not dispatched by this task's loop (transport,
-            // queue edits, help, navigation): leave them for later wiring.
-            _ => Action::Ignored,
+            keybindings::ChordResolution::Action(action) => {
+                ChordAction::Resolved(translate_action(action))
+            }
+            keybindings::ChordResolution::Pending => ChordAction::Pending,
+            keybindings::ChordResolution::None => ChordAction::Resolved(Action::Ignored),
         }
     }
 }
@@ -340,7 +442,76 @@ pub struct App {
     /// unavailable, so tracks play as 30-second previews and are labelled as
     /// such in the Now_Playing_Bar (Open Question 3, task 16.2).
     pub preview_mode: bool,
+    /// Whether the help overlay is currently shown (Requirement 7.3). Toggled
+    /// by the Help action.
+    pub show_help: bool,
+    /// The configured seek step in seconds, applied by Seek actions
+    /// (Requirement 4.6).
+    pub seek_step_seconds: u32,
+    /// The stored Music_User_Token used to authorize engine `load` requests
+    /// (Requirements 1.2, 1.6). `None` until a token is available; set at
+    /// startup from the Auth_Manager and refreshed on a successful sign-in.
+    pub music_user_token: Option<String>,
+    /// The Developer_Token used to authorize MusicKit in the engine's player
+    /// window for DRM playback. `None` until available; set at startup from the
+    /// Auth_Manager. Without it the player's `MusicKit.configure` cannot
+    /// authorize full-length streams.
+    pub developer_token: Option<String>,
+    /// Engine requests produced by key dispatch, drained and sent by the async
+    /// run loop after each event. Keeping dispatch synchronous (it only
+    /// enqueues here) makes [`handle_event`] pure and unit-testable while the
+    /// loop owns the actual `await`ed IPC send.
+    pub pending_requests: Vec<RequestMethod>,
+    /// The first key of an in-flight two-key chord (e.g. the `g` of `g l`), held
+    /// until the next key completes or cancels the chord.
+    pub pending_chord: Option<KeyEvent>,
+    /// A data fetch (catalog search or library page) produced by key dispatch,
+    /// run by the async loop which owns the API client and tokens. Kept separate
+    /// from [`App::pending_requests`] (engine transport) because a fetch needs
+    /// the authenticated API path, not the engine socket. At most one is
+    /// outstanding; a newer request replaces an unstarted older one.
+    pub pending_fetch: Option<FetchRequest>,
 }
+
+/// A data fetch the async loop performs on the app's behalf (Requirements 2, 3).
+///
+/// Dispatch is synchronous, so it records the intent here; the loop runs the
+/// actual authenticated HTTP request and feeds the result back into the view
+/// state. This mirrors the [`App::pending_requests`] pattern used for engine
+/// transport, keeping key handling pure and testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchRequest {
+    /// Run a catalog search for the given validated-at-submit query
+    /// (Requirement 2.1). The result replaces the Search view's results.
+    Search { query: String },
+    /// Open a Library section's first page (Requirement 3.2).
+    LibrarySection { section: LibrarySection },
+    /// Open an album's or playlist's track list (Requirement 3.5).
+    LibraryTracks { kind: LibrarySection, id: String },
+}
+
+/// The result of running a [`FetchRequest`], applied back into the view state by
+/// the loop (Requirements 2.3, 2.5, 3.5, 3.7).
+///
+/// Each variant carries either the parsed state to install or a user-facing
+/// (token-free) error message to show. The async loop builds these from the API
+/// responses; applying them is pure view-state mutation in [`App::apply_fetch`].
+pub enum FetchOutcome {
+    /// A completed catalog search: either the pagination to display or an error
+    /// message (invalid query / request failure, Requirements 2.2, 2.5).
+    Search(Result<SearchPagination, String>),
+    /// A completed library open: either the list to display (with whether it is
+    /// a track list, so Enter plays vs. drills) or an error message.
+    Library {
+        result: Result<LibraryList, String>,
+        is_track_list: bool,
+    },
+}
+
+/// The default seek step (seconds) used when an app is built without an explicit
+/// configuration (e.g. in tests). Matches the Config_File default (Requirement
+/// 4.6).
+const DEFAULT_SEEK_STEP_SECONDS: u32 = 10;
 
 impl App {
     /// Create an app with the given restored session, starting on the Search
@@ -375,7 +546,41 @@ impl App {
             queue_view,
             engine_error: None,
             preview_mode: false,
+            show_help: false,
+            seek_step_seconds: DEFAULT_SEEK_STEP_SECONDS,
+            music_user_token: None,
+            developer_token: None,
+            pending_requests: Vec::new(),
+            pending_chord: None,
+            pending_fetch: None,
         }
+    }
+
+    /// Apply startup configuration that the loop needs for dispatch: the seek
+    /// step (Requirement 4.6), the stored Music_User_Token used to authorize
+    /// engine `load` requests (Requirements 1.2, 1.6), and the Developer_Token
+    /// the engine's player needs to authorize DRM playback.
+    pub fn configure(
+        &mut self,
+        seek_step_seconds: u32,
+        music_user_token: Option<String>,
+        developer_token: Option<String>,
+    ) {
+        self.seek_step_seconds = seek_step_seconds;
+        self.music_user_token = music_user_token;
+        self.developer_token = developer_token;
+    }
+
+    /// Record a Music_User_Token captured from a successful sign-in so later
+    /// `load` requests are authorized (Requirements 1.3, 1.6).
+    pub fn set_music_user_token(&mut self, token: String) {
+        self.music_user_token = Some(token);
+    }
+
+    /// Set the Developer_Token used to authorize MusicKit for DRM playback in
+    /// the engine's player window.
+    pub fn set_developer_token(&mut self, token: String) {
+        self.developer_token = Some(token);
     }
 
     /// Enter preview-only mode after the Playback_Engine proved unavailable
@@ -434,9 +639,246 @@ impl App {
         sync_session_queue(&mut self.session, &self.queue);
         outcome
     }
-}
 
-/// Run the render/input loop until the user quits or a termination signal
+    /// Enqueue an engine request to be sent by the run loop after this event.
+    fn enqueue(&mut self, request: RequestMethod) {
+        self.pending_requests.push(request);
+    }
+
+    /// Build a `load` request for the Queue's current track at `position_ms`,
+    /// authorized with the stored Music_User_Token (Requirements 1.2, 1.6, 4.3).
+    /// Returns `None` when there is no current track or no token yet, in which
+    /// case no engine request is issued.
+    fn load_current(&self, position_ms: u64) -> Option<RequestMethod> {
+        let current = self.queue.current?;
+        let track = self.queue.tracks.get(current)?;
+        let token = self.music_user_token.clone()?;
+        Some(RequestMethod::Load {
+            track_id: track.track_id.clone(),
+            position_ms,
+            music_user_token: token,
+            // The Developer_Token may not be loaded yet; an empty string is
+            // sent in that case and the engine player reports a DRM/auth error
+            // rather than silently failing.
+            developer_token: self.developer_token.clone().unwrap_or_default(),
+        })
+    }
+
+    /// Toggle play/pause against the mirrored state, enqueueing the matching
+    /// engine request (Requirement 4.2). Does nothing when there is no current
+    /// track.
+    fn toggle_play_pause(&mut self) {
+        if self.queue.current.is_none() {
+            return;
+        }
+        match self.playback.status {
+            PlaybackStatus::Playing => {
+                self.playback.status = PlaybackStatus::Paused;
+                self.enqueue(RequestMethod::Pause);
+            }
+            PlaybackStatus::Paused | PlaybackStatus::Stopped => {
+                self.playback.status = PlaybackStatus::Playing;
+                self.enqueue(RequestMethod::Play);
+            }
+        }
+    }
+
+    /// Apply a computed [`queue::Transition`] (next/previous): move the current
+    /// pointer, reflect the new track, reset the position, and enqueue a `load`
+    /// (plus `pause` when the transition parks paused) (Requirements 4.3–4.5).
+    fn apply_transition(&mut self, transition: queue::Transition) {
+        self.queue.current = Some(transition.index);
+        self.queue_view.selected = Some(transition.index);
+        self.playback.position_ms = 0;
+        self.playback.status = transition.status;
+        reflect_current_track(&mut self.playback, &self.queue);
+        sync_session_queue(&mut self.session, &self.queue);
+
+        if let Some(load) = self.load_current(0) {
+            self.enqueue(load);
+            // The engine loads every track paused, so the follow-up transport
+            // command must match the intended status: Pause to stay paused, or
+            // Play to actually start audio on a Playing transition.
+            match transition.status {
+                PlaybackStatus::Paused => self.enqueue(RequestMethod::Pause),
+                PlaybackStatus::Playing => self.enqueue(RequestMethod::Play),
+                PlaybackStatus::Stopped => {}
+            }
+        }
+    }
+
+    /// Skip to the next track under the current repeat mode (Requirement 4.3).
+    fn next_track(&mut self) {
+        if let Some(transition) = self.queue.next_transition(self.playback.repeat) {
+            self.apply_transition(transition);
+        }
+    }
+
+    /// Skip to the previous track, honoring the restart threshold (Reqs 4.4/4.5).
+    fn previous_track(&mut self) {
+        if let Some(transition) = self.queue.previous_transition(self.playback.position_ms) {
+            self.apply_transition(transition);
+        }
+    }
+
+    /// Seek by the configured step in `direction`, updating the mirrored
+    /// position and enqueueing a `seek` — or advancing like a track finish when
+    /// a forward seek runs off the end (Requirement 4.6 / 4.8).
+    fn seek(&mut self, direction: now_playing::SeekDirection) {
+        if self.queue.current.is_none() {
+            return;
+        }
+        match now_playing::seek(
+            self.playback.position_ms,
+            self.playback.duration_ms,
+            self.seek_step_seconds,
+            direction,
+        ) {
+            now_playing::SeekOutcome::Position(position_ms) => {
+                self.playback.position_ms = position_ms;
+                self.enqueue(RequestMethod::Seek { position_ms });
+            }
+            now_playing::SeekOutcome::TrackFinished => {
+                if let Some(transition) =
+                    self.queue.track_finished_transition(self.playback.repeat)
+                {
+                    self.apply_transition(transition);
+                }
+            }
+        }
+    }
+
+    /// Adjust the volume by `delta`, clamping to 0..=100 and enqueueing a
+    /// `setVolume` (Requirement 4.7).
+    fn adjust_volume(&mut self, delta: i64) {
+        let level = now_playing::clamp_volume(self.playback.volume as i64 + delta);
+        self.playback.volume = level;
+        self.session.volume = level;
+        self.enqueue(RequestMethod::SetVolume { level });
+    }
+
+    /// Toggle shuffle mode on/off, restoring order when turning it off
+    /// (Requirements 5.6, 5.7). Reflects the new flag into the session.
+    fn toggle_shuffle(&mut self) {
+        if self.playback.shuffle {
+            self.queue.unshuffle();
+            self.playback.shuffle = false;
+        } else {
+            self.queue.shuffle();
+            self.playback.shuffle = true;
+        }
+        self.session.shuffle = self.playback.shuffle;
+        self.queue_view.clamp_to(&self.queue);
+        reflect_current_track(&mut self.playback, &self.queue);
+        sync_session_queue(&mut self.session, &self.queue);
+    }
+
+    /// Cycle the repeat mode off → all → one (Requirement 5.8).
+    fn cycle_repeat(&mut self) {
+        self.playback.repeat = queue::cycle_repeat(self.playback.repeat);
+        self.session.repeat = self.playback.repeat;
+    }
+
+    /// Apply a Queue-view edit (remove/move) and, when it changes the current
+    /// track, drive the engine: load+play the new current track or stop on an
+    /// emptied Queue (Requirements 5.4, 5.5, 5.11).
+    fn dispatch_queue_edit(&mut self, edit: QueueEdit) {
+        match self.apply_queue_edit(edit) {
+            QueueEditOutcome::CurrentAdvanced { .. } => {
+                // The pointer advanced to a new current track. Load it at the
+                // start; keep playing only if playback was active.
+                let was_playing = self.playback.status == PlaybackStatus::Playing;
+                self.playback.position_ms = 0;
+                if let Some(load) = self.load_current(0) {
+                    self.enqueue(load);
+                    if !was_playing {
+                        self.enqueue(RequestMethod::Pause);
+                    }
+                }
+            }
+            QueueEditOutcome::Emptied => {
+                self.playback.status = PlaybackStatus::Stopped;
+                self.playback.position_ms = 0;
+                self.enqueue(RequestMethod::Pause);
+            }
+            QueueEditOutcome::Edited
+            | QueueEditOutcome::Rejected
+            | QueueEditOutcome::NoOp => {}
+        }
+    }
+
+    /// Replace the Queue with `queue` and start playback at its current track
+    /// (Requirements 2.7, 3.5). Reflects the new current track into the bar and
+    /// enqueues a `load` + `play` when a token is available.
+    fn play_queue(&mut self, queue: Queue) {
+        self.queue = queue;
+        self.queue_view = QueueViewState::for_queue(&self.queue);
+        self.playback.position_ms = 0;
+        self.playback.status = PlaybackStatus::Playing;
+        reflect_current_track(&mut self.playback, &self.queue);
+        sync_session_queue(&mut self.session, &self.queue);
+        if let Some(load) = self.load_current(0) {
+            self.enqueue(load);
+            // The engine loads a track paused; an explicit Play is required to
+            // start audio (and to drive the first DRM license request). Without
+            // this the UI shows Playing but the engine never starts the stream.
+            self.enqueue(RequestMethod::Play);
+        }
+    }
+
+    /// The [`QueueTrack`] for the selection in the Search view, for the
+    /// play-next / add-to-queue edits (Requirements 5.2, 5.3). Only a selected
+    /// Song yields a track; other resource types (which would need a drill-down
+    /// fetch) and the other views yield `None`.
+    fn selected_track_for_queue(&self) -> Option<QueueTrack> {
+        let object = match self.view {
+            View::Search => self.search.selected_object()?,
+            // Library drill-down selections and the Queue view's own rows are
+            // out of scope for play-next / add-to-queue here.
+            View::Library | View::Queue => return None,
+        };
+        match object {
+            Domain_Object::Song {
+                id,
+                name,
+                artist_name,
+                duration_ms,
+                ..
+            } => Some(QueueTrack {
+                track_id: id.clone(),
+                title: name.clone(),
+                artist: artist_name.clone(),
+                duration_ms: *duration_ms,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Apply a completed [`FetchOutcome`] to the view state (Requirements 2.3,
+    /// 2.5, 3.5, 3.7). Pure view-state mutation; the async loop owns the fetch.
+    pub fn apply_fetch(&mut self, outcome: FetchOutcome) {
+        match outcome {
+            FetchOutcome::Search(Ok(pagination)) => self.search.set_results(pagination),
+            FetchOutcome::Search(Err(message)) => self.search.set_message(message),
+            FetchOutcome::Library {
+                result: Ok(list),
+                is_track_list,
+            } => {
+                self.library.message = None;
+                self.library.open_list(list, is_track_list);
+            }
+            FetchOutcome::Library {
+                result: Err(message),
+                ..
+            } => {
+                // Surface the failure in the Library view and log it; the view's
+                // current contents are left in place (Requirement 3.7).
+                log_app_error(&message);
+                self.library.message = Some(message);
+            }
+        }
+    }
+}
 /// arrives (Requirements 10.1, 12.9, 12.10, 7.6, 7.9).
 ///
 /// The loop:
@@ -468,18 +910,23 @@ impl App {
 /// "lost connection"). On the first such report the loop enters preview-only
 /// mode (banner + preview labelling), keeping the Queue and current track
 /// (task 16.2). It is only consulted while no engine error is already showing.
-pub async fn run<F, Fut, W>(
+pub async fn run<F, Fut, W, T, Q, QFut>(
     guard: &mut TerminalGuard,
     app: &mut App,
     resolver: &dyn ActionResolver,
     engine: Option<&IpcSender>,
     mut restart_engine: F,
     mut engine_watch: W,
+    mut token_watch: T,
+    mut fetch: Q,
 ) -> io::Result<LoopOutcome>
 where
     F: FnMut(EngineErrorState) -> Fut,
     Fut: std::future::Future<Output = bool>,
     W: FnMut() -> Option<preview::EngineFailure>,
+    T: FnMut() -> Option<String>,
+    Q: FnMut(FetchRequest) -> QFut,
+    QFut: std::future::Future<Output = FetchOutcome>,
 {
     let mut events = EventStream::new();
     let mut signals = SignalListener::new()?;
@@ -513,6 +960,21 @@ where
                             }
                             EventResult::Continue => {}
                         }
+                        // Send any engine requests the dispatch enqueued
+                        // (transport/seek/volume/load). Draining here keeps
+                        // `handle_event` synchronous while the loop owns the
+                        // awaited IPC send; a send failure is best-effort and
+                        // must not break the input loop.
+                        send_pending_requests(app, engine).await;
+                        // Run a data fetch (search / library open) the dispatch
+                        // requested, then apply the result to the view state.
+                        // Drawing once before awaiting the fetch shows the
+                        // in-progress message (e.g. "searching…") immediately.
+                        if let Some(request) = app.pending_fetch.take() {
+                            draw(guard, app)?;
+                            let outcome = fetch(request).await;
+                            app.apply_fetch(outcome);
+                        }
                         draw(guard, app)?;
                     }
                     // Input stream error or EOF (e.g. stdin closed): treat as a
@@ -537,6 +999,12 @@ where
                     if let Some(failure) = engine_watch() {
                         app.enter_preview_mode(failure);
                     }
+                }
+                // Pick up a Music_User_Token captured by a mid-session sign-in
+                // so post-login transport actions can authorize `load`
+                // (Requirements 1.3, 1.6).
+                if let Some(token) = token_watch() {
+                    app.set_music_user_token(token);
                 }
                 draw(guard, app)?;
             }
@@ -569,6 +1037,11 @@ const RESTART_KEY: char = 'r';
 /// (Requirement 12.10). Key presses are resolved to actions; only key *press*
 /// events are acted on so a key is not handled twice on terminals that also
 /// report releases.
+///
+/// Dispatch is synchronous and pure with respect to I/O: it mutates the app's
+/// view state / Queue / mirrored playback and pushes any engine requests onto
+/// [`App::pending_requests`], which the async loop drains and sends. Two-key
+/// sequences (e.g. `g l`) are tracked via [`App::pending_chord`].
 fn handle_event(event: Event, app: &mut App, resolver: &dyn ActionResolver) -> EventResult {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -582,19 +1055,226 @@ fn handle_event(event: Event, app: &mut App, resolver: &dyn ActionResolver) -> E
             {
                 return EventResult::RestartEngine;
             }
-            match resolver.resolve(app.view, key) {
-                Action::Quit => EventResult::Quit,
-                Action::Switch(view) => {
-                    // Switching views must not disturb playback or the Queue
-                    // (Requirement 4.9): only the drawn content changes.
-                    app.switch_view(view);
+
+            // When the Search query field has focus, typed keys are text, not
+            // bindings (Requirement 2.1, 7.7). Enter submits the query and Esc
+            // leaves the field; everything else edits the text. This is checked
+            // before binding resolution so a letter like `n` types a character
+            // instead of triggering NextTrack.
+            if app.view == View::Search && app.search.query_focused {
+                return handle_search_input(key, app);
+            }
+
+            // Resolve the press, completing or opening a two-key chord as needed.
+            let pending = app.pending_chord.take();
+            match resolver.resolve_chord(app.view, pending, key) {
+                ChordAction::Pending => {
+                    // First key of a two-key binding: hold it for the next press.
+                    app.pending_chord = Some(key);
                     EventResult::Continue
                 }
-                Action::Ignored => EventResult::Continue,
+                ChordAction::Resolved(action) => dispatch_action(action, app),
             }
         }
         // Resize and other events fall through to a redraw by the caller.
         _ => EventResult::Continue,
+    }
+}
+
+/// Handle a key press while the Search query field has focus (Requirements 2.1,
+/// 2.2, 7.7).
+///
+/// Enter submits: a non-blank query is enqueued as a [`FetchRequest::Search`]
+/// for the async loop to run and focus leaves the field; a blank query shows a
+/// validation message and keeps focus. Esc leaves the field without searching.
+/// Every other key edits the text via [`TextInputField`], so characters are
+/// inserted rather than triggering their bindings.
+fn handle_search_input(key: KeyEvent, app: &mut App) -> EventResult {
+    if key.code == KeyCode::Enter {
+        let query = app.search.query.value().trim().to_string();
+        if query.is_empty() {
+            app.search.set_message("enter a search term");
+            return EventResult::Continue;
+        }
+        app.search.query_focused = false;
+        app.search.message = Some(format!("searching for \u{201c}{query}\u{201d}\u{2026}"));
+        app.pending_fetch = Some(FetchRequest::Search { query });
+        return EventResult::Continue;
+    }
+    match app.search.query.handle_key(key) {
+        TextInputOutcome::Exited { .. } => {
+            // Esc leaves the field; keep any typed text so the user can resume.
+            app.search.query_focused = false;
+        }
+        TextInputOutcome::Inserted { .. }
+        | TextInputOutcome::Deleted { .. }
+        | TextInputOutcome::Passthrough => {}
+    }
+    EventResult::Continue
+}
+
+/// Dispatch a resolved [`Action`] against the app, mutating state and enqueueing
+/// engine requests (Requirements 4, 5, 7). Returns the loop control flow.
+fn dispatch_action(action: Action, app: &mut App) -> EventResult {
+    match action {
+        Action::Quit => return EventResult::Quit,
+        Action::Switch(view) => {
+            // Switching views must not disturb playback or the Queue
+            // (Requirement 4.9): only the drawn content changes.
+            app.switch_view(view);
+            // Entering Search focuses the query field so the user can type a
+            // term immediately (Requirement 2.1); leaving Search drops focus.
+            app.search.query_focused = view == View::Search;
+        }
+        Action::ToggleHelp => app.show_help = !app.show_help,
+        // Sign-out requires the Auth/engine wiring the loop does not own; record
+        // it so the surrounding layer (main.rs) can act. For now it is a no-op
+        // on view state so the key is recognized rather than silently dropped.
+        Action::SignOut => {}
+        Action::NavDown => nav_down(app),
+        Action::NavUp => nav_up(app),
+        Action::NavOpen => nav_open(app),
+        Action::NavBack => nav_back(app),
+        Action::PlayPause => app.toggle_play_pause(),
+        Action::NextTrack => app.next_track(),
+        Action::PreviousTrack => app.previous_track(),
+        Action::SeekForward => app.seek(now_playing::SeekDirection::Forward),
+        Action::SeekBackward => app.seek(now_playing::SeekDirection::Backward),
+        Action::VolumeUp => app.adjust_volume(VOLUME_STEP),
+        Action::VolumeDown => app.adjust_volume(-VOLUME_STEP),
+        Action::ToggleShuffle => app.toggle_shuffle(),
+        Action::CycleRepeat => app.cycle_repeat(),
+        // Refreshing the Library requires an API fetch the loop does not own;
+        // recognized but a no-op here (no network wiring in the loop).
+        Action::RefreshLibrary => {}
+        Action::PlayNext | Action::AddToQueue => {
+            // Insert the selected search/library item into the Queue
+            // (Requirements 5.2, 5.3). Only a selected Song maps to a Queue
+            // track; other selections are no-ops here.
+            if let Some(track) = app.selected_track_for_queue() {
+                let edit = if matches!(action, Action::PlayNext) {
+                    QueueEdit::PlayNext(track)
+                } else {
+                    QueueEdit::AddToQueue(track)
+                };
+                app.dispatch_queue_edit(edit);
+            }
+        }
+        Action::RemoveFromQueue => {
+            if let Some(edit) = app.queue_view.remove_selected() {
+                app.dispatch_queue_edit(edit);
+            }
+        }
+        Action::MoveUp => {
+            if let Some(edit) = app.queue_view.move_selected_up() {
+                app.dispatch_queue_edit(edit);
+            }
+        }
+        Action::MoveDown => {
+            if let Some(edit) = app.queue_view.move_selected_down() {
+                app.dispatch_queue_edit(edit);
+            }
+        }
+        Action::Ignored => {}
+    }
+    EventResult::Continue
+}
+
+/// The amount a single volume-up/down press changes the level (Requirement 4.7).
+const VOLUME_STEP: i64 = 5;
+
+/// Move the selection down in the active view (Requirement 7.2).
+fn nav_down(app: &mut App) {
+    match app.view {
+        View::Search => app.search.select_next(),
+        View::Library => app.library.select_next(),
+        View::Queue => app.queue_view.select_next(&app.queue),
+    }
+}
+
+/// Move the selection up in the active view (Requirement 7.2).
+fn nav_up(app: &mut App) {
+    match app.view {
+        View::Search => app.search.select_previous(),
+        View::Library => app.library.select_previous(),
+        View::Queue => app.queue_view.select_previous(&app.queue),
+    }
+}
+
+/// Open/activate the current selection in the active view (Requirements 2.7,
+/// 2.8, 3.1, 3.5, 5, 7.2).
+///
+/// Playable activations that carry a ready-to-use Queue (a selected song, or a
+/// library track list) replace the Queue and start playback immediately. Drill-
+/// down activations (opening a library section, or an album/playlist's tracks)
+/// enqueue a [`FetchRequest`] the async loop runs against the API client. In
+/// the Queue view, opening the selection plays that track.
+fn nav_open(app: &mut App) {
+    match app.view {
+        View::Search => match app.search.activate_selection() {
+            Some(SearchActivation::PlaySong(queue)) => app.play_queue(queue),
+            // Drilling into an album/playlist from search opens its tracks via
+            // the library tracks endpoint (Requirement 2.8).
+            Some(SearchActivation::OpenTracks { kind, id }) => {
+                app.pending_fetch = Some(FetchRequest::LibraryTracks { kind, id });
+            }
+            // Artist drill-down needs a catalog detail fetch the loop does not
+            // perform yet; recognized but not actioned here.
+            Some(SearchActivation::OpenArtist { .. }) | None => {}
+        },
+        View::Library => match app.library.activate_selection() {
+            Some(LibraryActivation::PlaySong(queue))
+            | Some(LibraryActivation::PlayTracks(queue)) => app.play_queue(queue),
+            // Opening a section from the picker fetches its first page
+            // (Requirement 3.1/3.2).
+            Some(LibraryActivation::OpenSection(section)) => {
+                app.pending_fetch = Some(FetchRequest::LibrarySection { section });
+            }
+            // Opening an album/playlist fetches its tracks (Requirement 3.5).
+            Some(LibraryActivation::OpenTracks { kind, id }) => {
+                app.pending_fetch = Some(FetchRequest::LibraryTracks { kind, id });
+            }
+            // Artist drill-down is a catalog detail fetch not wired here.
+            Some(LibraryActivation::OpenArtist { .. }) | None => {}
+        },
+        View::Queue => {
+            if let Some(index) = app.queue_view.selected {
+                if index < app.queue.len() {
+                    let transition = queue::Transition {
+                        index,
+                        status: PlaybackStatus::Playing,
+                    };
+                    app.apply_transition(transition);
+                }
+            }
+        }
+    }
+}
+
+/// Return from a drilled-in Library list to the section picker (Requirement
+/// 7.2). The other views have no "back" level, so this is a no-op there.
+fn nav_back(app: &mut App) {
+    if app.view == View::Library {
+        app.library.back_to_sections(0);
+    }
+}
+
+/// Drain [`App::pending_requests`] and send each over the engine connection.
+///
+/// Dispatch enqueues transport/seek/volume/load requests synchronously; this is
+/// the single awaited send site. Sends are best-effort: a failed send is logged
+/// (token values are never part of the logged message) and the loop continues,
+/// so a momentarily dead socket does not freeze input. When no engine is
+/// connected (preview-only), the queued requests are simply dropped.
+async fn send_pending_requests(app: &mut App, engine: Option<&IpcSender>) {
+    let requests = std::mem::take(&mut app.pending_requests);
+    let Some(sender) = engine else {
+        return;
+    };
+    for request in requests {
+        if let Err(err) = sender.send(&request).await {
+            log_app_error(&format!("failed to send engine request: {err}"));
+        }
     }
 }
 
@@ -689,6 +1369,36 @@ fn render_main_view(frame: &mut Frame, app: &App) {
     }
     render_content(frame, chunks[idx], app);
     render_now_playing(frame, chunks[idx + 1], &app.playback, app.preview_mode);
+
+    // The help overlay is drawn last, over the content area, when toggled on
+    // (Requirement 7.3). It lists the default action keys as a quick reference.
+    if app.show_help {
+        render_help_overlay(frame, chunks[idx]);
+    }
+}
+
+/// Render a simple help overlay listing the default keybindings (Requirement
+/// 7.3). Drawn over the content area; dismissed by toggling Help again.
+fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    let lines: Vec<&str> = vec![
+        "Help — press ? to close",
+        "",
+        "j / k / ↓ / ↑   move selection",
+        "l / → / Enter   open selected",
+        "h / ←           back",
+        "/               search    g l  library    g q  queue",
+        "Space           play / pause",
+        "n / p           next / previous track",
+        "] / [           seek forward / backward",
+        "+ / -           volume up / down",
+        "s               shuffle    r   cycle repeat",
+        "N / a / x       play-next / add / remove (queue)",
+        "K / J           move up / down (queue)",
+        "g o             sign out   q   quit",
+    ];
+    let text: Vec<Line> = lines.into_iter().map(|l| Line::from(l.to_string())).collect();
+    let block = Block::default().borders(Borders::ALL).title("Help");
+    frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
 /// Render the Playback_Engine error banner naming the failure and the restart
@@ -1144,6 +1854,13 @@ fn search_section_items(results: &SearchResults, section: SearchSection) -> &[Do
 /// results only, skipping headers and info lines.
 #[derive(Debug, Default)]
 pub struct SearchViewState {
+    /// The query text field. When [`query_focused`](SearchViewState::query_focused)
+    /// is set, key presses are routed here as text instead of triggering their
+    /// bindings (Requirement 2.1, 7.7).
+    pub query: TextInputField,
+    /// Whether the query field has focus and is capturing typed text. Entered
+    /// with the Search action and left on Esc or when a search is submitted.
+    pub query_focused: bool,
     /// The accumulated results and per-section pagination of the latest search,
     /// or `None` before any search has completed.
     pub pagination: Option<SearchPagination>,
@@ -1358,12 +2075,17 @@ fn library_section_title(section: LibrarySection) -> &'static str {
 pub struct LibraryViewState {
     /// Current focus: the section picker or a drilled-in list.
     pub focus: LibraryFocus,
+    /// A transient one-line message shown above the content: a load failure or
+    /// session-expiry notice (Requirements 3.7, 3.9). `None` when there is
+    /// nothing to report.
+    pub message: Option<String>,
 }
 
 impl Default for LibraryViewState {
     fn default() -> Self {
         LibraryViewState {
             focus: LibraryFocus::Sections { selected: 0 },
+            message: None,
         }
     }
 }
@@ -1530,7 +2252,22 @@ pub fn render_search_view(frame: &mut Frame, area: Rect, state: &SearchViewState
         .selected
         .and_then(|sel| selectable.get(sel).copied());
 
-    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len() + 1);
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len() + 2);
+
+    // The query input line. A trailing cursor marks the field when focused so
+    // the user can see their typed term (Requirement 2.1).
+    let prompt = if state.query_focused {
+        format!("Search: {}\u{2588}", state.query.value())
+    } else {
+        format!("Search: {}", state.query.value())
+    };
+    let prompt_style = if state.query_focused {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    items.push(ListItem::new(Line::from(Span::styled(prompt, prompt_style))));
+
     if let Some(message) = &state.message {
         items.push(ListItem::new(Line::from(Span::styled(
             message.clone(),
@@ -1575,29 +2312,38 @@ fn search_row_item(row: &SearchRow, selected: bool) -> ListItem<'static> {
 /// when a request failed (Requirement 3.7), or the item rows with the selected
 /// one highlighted.
 pub fn render_library_view(frame: &mut Frame, area: Rect, state: &LibraryViewState) {
+    // A load-failure / session-expiry notice is shown on the first line when
+    // present (Requirements 3.7, 3.9), above whatever the view is focused on.
+    let message_item = state.message.as_ref().map(|message| {
+        ListItem::new(Line::from(Span::styled(
+            message.clone(),
+            Style::default().add_modifier(Modifier::ITALIC | Modifier::BOLD),
+        )))
+    });
+
     match &state.focus {
         LibraryFocus::Sections { selected } => {
             let block = Block::default().borders(Borders::ALL).title("Library");
-            let items: Vec<ListItem> = LibrarySection::ALL
-                .iter()
-                .enumerate()
-                .map(|(idx, section)| {
-                    let style = if idx == *selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    ListItem::new(Line::from(Span::styled(
-                        library_section_title(*section).to_string(),
-                        style,
-                    )))
-                })
-                .collect();
+            let mut items: Vec<ListItem> = Vec::new();
+            if let Some(message_item) = message_item {
+                items.push(message_item);
+            }
+            items.extend(LibrarySection::ALL.iter().enumerate().map(|(idx, section)| {
+                let style = if idx == *selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(
+                    library_section_title(*section).to_string(),
+                    style,
+                )))
+            }));
             frame.render_widget(List::new(items).block(block), area);
         }
         LibraryFocus::List {
             list, selected, ..
-        } => render_library_list(frame, area, list, *selected),
+        } => render_library_list(frame, area, list, *selected, message_item),
     }
 }
 
@@ -1618,10 +2364,18 @@ fn library_empty_message(has_load_error: bool) -> &'static str {
 }
 
 /// Render a drilled-in Library list: loading / empty / error states and the
-/// item rows (Requirements 3.2, 3.4, 3.7, 3.8).
-fn render_library_list(frame: &mut Frame, area: Rect, list: &LibraryList, selected: Option<usize>) {
+/// item rows (Requirements 3.2, 3.4, 3.7, 3.8). An optional `message_item`
+/// (a load-failure / session-expiry notice) is shown on the first line.
+fn render_library_list(
+    frame: &mut Frame,
+    area: Rect,
+    list: &LibraryList,
+    selected: Option<usize>,
+    message_item: Option<ListItem<'static>>,
+) {
     let block = Block::default().borders(Borders::ALL).title("Library");
     let st = list.state();
+    let has_message = message_item.is_some();
 
     // Loading indicator for the first page: loading with nothing shown yet
     // (Requirement 3.2).
@@ -1634,12 +2388,21 @@ fn render_library_list(frame: &mut Frame, area: Rect, list: &LibraryList, select
     // Empty state once a page has loaded and there is nothing to show
     // (Requirement 3.8). A load error with no prior items shows the load error.
     if list.is_empty() {
-        let message = library_empty_message(list.has_load_error());
-        frame.render_widget(Paragraph::new(message).block(block), area);
+        let mut items: Vec<ListItem> = Vec::new();
+        if let Some(message_item) = message_item {
+            items.push(message_item);
+        }
+        items.push(ListItem::new(Line::from(library_empty_message(
+            list.has_load_error(),
+        ))));
+        frame.render_widget(List::new(items).block(block), area);
         return;
     }
 
-    let mut items: Vec<ListItem> = Vec::with_capacity(list.items().len() + 1);
+    let mut items: Vec<ListItem> = Vec::with_capacity(list.items().len() + 2);
+    if let Some(message_item) = message_item {
+        items.push(message_item);
+    }
     if list.has_load_error() {
         // Keep prior items (Requirement 3.7) and surface the load error above.
         items.push(ListItem::new(Line::from(Span::styled(
@@ -1647,6 +2410,9 @@ fn render_library_list(frame: &mut Frame, area: Rect, list: &LibraryList, select
             Style::default().add_modifier(Modifier::ITALIC),
         ))));
     }
+    // Count the non-selectable leading rows so the selection highlight lands on
+    // the right item.
+    let lead = (has_message as usize) + (list.has_load_error() as usize);
     for (idx, object) in list.items().iter().enumerate() {
         let style = if Some(idx) == selected {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -1660,7 +2426,7 @@ fn render_library_list(frame: &mut Frame, area: Rect, list: &LibraryList, select
     }
 
     let mut list_state = ListState::default();
-    list_state.select(selected);
+    list_state.select(selected.map(|s| s + lead));
     frame.render_stateful_widget(List::new(items).block(block), area, &mut list_state);
 }
 
@@ -2198,18 +2964,19 @@ mod tests {
     }
 
     #[test]
-    fn keybinding_resolver_ignores_unbound_and_non_lifecycle_keys() {
+    fn keybinding_resolver_maps_transport_and_ignores_unbound() {
         let resolution = keybindings::resolve_keybindings(&crate::config::Configuration::default());
         let resolver = KeybindingActionResolver::new(resolution);
-        // `z` is unbound; `space` is PlayPause (not a lifecycle action this task
-        // dispatches). Both resolve to Ignored here.
+        // `z` is unbound and resolves to Ignored.
         assert_eq!(
             resolver.resolve(View::Search, press(KeyCode::Char('z'))),
             Action::Ignored
         );
+        // `space` is the default PlayPause binding and now resolves to the
+        // transport action the loop dispatches.
         assert_eq!(
             resolver.resolve(View::Search, press(KeyCode::Char(' '))),
-            Action::Ignored
+            Action::PlayPause
         );
     }
 
@@ -2406,6 +3173,266 @@ mod tests {
         assert!(!looks_like_jwt("a.b.c"));
         assert!(!looks_like_jwt("not-a-token"));
         assert!(!looks_like_jwt("one.two"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Keyboard dispatch (transport / navigation / queue editing / chords).
+    // -------------------------------------------------------------------------
+
+    /// An app with a three-track Queue (current at index 0), a stored token so
+    /// `load` requests are produced, and playing status.
+    fn playing_app() -> App {
+        let tracks = (0..3)
+            .map(|i| SerializedTrack {
+                track_id: format!("t{i}"),
+                title: format!("Song {i}"),
+                artist: "Artist".to_string(),
+                duration_ms: Some(200_000),
+            })
+            .collect();
+        let session = Session_State {
+            queue: SerializedQueue { tracks },
+            current_index: Some(0),
+            ..Session_State::default()
+        };
+        let mut app = App::new(session);
+        app.configure(10, Some("mut-token".to_string()), Some("dev-token".to_string()));
+        app.playback.status = PlaybackStatus::Playing;
+        app
+    }
+
+    /// Dispatch a press through the real Keybinding resolver (default config).
+    fn dispatch_key(app: &mut App, code: KeyCode) -> EventResult {
+        let resolution = keybindings::resolve_keybindings(&crate::config::Configuration::default());
+        let resolver = KeybindingActionResolver::new(resolution);
+        handle_event(Event::Key(press(code)), app, &resolver)
+    }
+
+    #[test]
+    fn space_toggles_play_pause_and_enqueues_request() {
+        let mut app = playing_app();
+        // Playing -> Paused, enqueues Pause.
+        dispatch_key(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.playback.status, PlaybackStatus::Paused);
+        assert_eq!(app.pending_requests, vec![RequestMethod::Pause]);
+
+        app.pending_requests.clear();
+        // Paused -> Playing, enqueues Play.
+        dispatch_key(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.playback.status, PlaybackStatus::Playing);
+        assert_eq!(app.pending_requests, vec![RequestMethod::Play]);
+    }
+
+    #[test]
+    fn next_track_advances_pointer_and_loads() {
+        let mut app = playing_app();
+        dispatch_key(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.queue.current, Some(1));
+        assert_eq!(
+            app.pending_requests,
+            vec![
+                RequestMethod::Load {
+                    track_id: "t1".to_string(),
+                    position_ms: 0,
+                    music_user_token: "mut-token".to_string(),
+                    developer_token: "dev-token".to_string(),
+                },
+                RequestMethod::Play,
+            ]
+        );
+    }
+
+    #[test]
+    fn previous_track_steps_back_within_threshold() {
+        let mut app = playing_app();
+        app.queue.current = Some(2);
+        app.queue_view.selected = Some(2);
+        app.playback.position_ms = 1_000; // within the restart threshold
+        dispatch_key(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.queue.current, Some(1));
+    }
+
+    #[test]
+    fn volume_keys_clamp_and_enqueue_set_volume() {
+        let mut app = playing_app();
+        app.playback.volume = 100;
+        dispatch_key(&mut app, KeyCode::Char('+')); // clamps at 100
+        assert_eq!(app.playback.volume, 100);
+        assert_eq!(app.pending_requests, vec![RequestMethod::SetVolume { level: 100 }]);
+
+        app.pending_requests.clear();
+        dispatch_key(&mut app, KeyCode::Char('-')); // 100 - 5
+        assert_eq!(app.playback.volume, 95);
+        assert_eq!(app.pending_requests, vec![RequestMethod::SetVolume { level: 95 }]);
+    }
+
+    #[test]
+    fn seek_forward_enqueues_seek_at_new_position() {
+        let mut app = playing_app();
+        app.playback.position_ms = 0;
+        app.playback.duration_ms = Some(200_000);
+        dispatch_key(&mut app, KeyCode::Char(']')); // +10s with default step
+        assert_eq!(app.playback.position_ms, 10_000);
+        assert_eq!(app.pending_requests, vec![RequestMethod::Seek { position_ms: 10_000 }]);
+    }
+
+    #[test]
+    fn cycle_repeat_and_toggle_shuffle_update_state() {
+        let mut app = playing_app();
+        assert_eq!(app.playback.repeat, RepeatMode::Off);
+        dispatch_key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.playback.repeat, RepeatMode::RepeatAll);
+
+        assert!(!app.playback.shuffle);
+        dispatch_key(&mut app, KeyCode::Char('s'));
+        assert!(app.playback.shuffle);
+        assert!(app.session.shuffle);
+    }
+
+    #[test]
+    fn nav_down_up_moves_queue_selection() {
+        let mut app = playing_app();
+        app.switch_view(View::Queue);
+        app.queue_view.selected = Some(0);
+        dispatch_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.queue_view.selected, Some(1));
+        dispatch_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.queue_view.selected, Some(0));
+    }
+
+    #[test]
+    fn remove_from_queue_edits_the_queue() {
+        let mut app = playing_app();
+        app.switch_view(View::Queue);
+        app.queue_view.selected = Some(1); // a non-current track
+        let before = app.queue.len();
+        dispatch_key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.queue.len(), before - 1);
+    }
+
+    #[test]
+    fn g_chord_opens_queue_and_lone_g_is_pending() {
+        let mut app = playing_app();
+        // First `g`: held as a pending chord prefix, view unchanged.
+        let result = dispatch_key(&mut app, KeyCode::Char('g'));
+        assert_eq!(result, EventResult::Continue);
+        assert!(app.pending_chord.is_some());
+        assert_eq!(app.view, View::Search);
+        // Then `q`: completes `g q` -> switch to the Queue view (not Quit).
+        let result = dispatch_key(&mut app, KeyCode::Char('q'));
+        assert_eq!(result, EventResult::Continue);
+        assert!(app.pending_chord.is_none());
+        assert_eq!(app.view, View::Queue);
+    }
+
+    #[test]
+    fn lone_q_still_quits_when_no_chord_pending() {
+        let mut app = playing_app();
+        let result = dispatch_key(&mut app, KeyCode::Char('q'));
+        assert_eq!(result, EventResult::Quit);
+    }
+
+    #[test]
+    fn help_key_toggles_overlay() {
+        let mut app = playing_app();
+        assert!(!app.show_help);
+        dispatch_key(&mut app, KeyCode::Char('?'));
+        assert!(app.show_help);
+        dispatch_key(&mut app, KeyCode::Char('?'));
+        assert!(!app.show_help);
+    }
+
+    #[tokio::test]
+    async fn send_pending_requests_drains_queue() {
+        let mut app = playing_app();
+        app.pending_requests
+            .push(RequestMethod::SetVolume { level: 50 });
+        // With no engine connected, requests are dropped but the queue is drained
+        // so stale requests are not re-sent.
+        send_pending_requests(&mut app, None).await;
+        assert!(app.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn switching_to_search_focuses_the_query_field() {
+        let mut app = playing_app();
+        // Default config: `/` focuses Search.
+        dispatch_key(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.view, View::Search);
+        assert!(app.search.query_focused);
+    }
+
+    #[test]
+    fn typing_while_focused_inserts_text_not_bindings() {
+        let mut app = playing_app();
+        app.switch_view(View::Search);
+        app.search.query_focused = true;
+        // `n` would be NextTrack if not focused; here it must type a character.
+        for c in ['n', 'i', 'n'] {
+            dispatch_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.search.query.value(), "nin");
+        // No transport happened.
+        assert!(app.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn enter_submits_search_and_enqueues_fetch() {
+        let mut app = playing_app();
+        app.switch_view(View::Search);
+        app.search.query_focused = true;
+        for c in ['j', 'a', 'z'] {
+            dispatch_key(&mut app, KeyCode::Char(c));
+        }
+        dispatch_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.pending_fetch,
+            Some(FetchRequest::Search { query: "jaz".to_string() })
+        );
+        // Focus leaves the field after submitting.
+        assert!(!app.search.query_focused);
+    }
+
+    #[test]
+    fn empty_search_shows_message_and_keeps_focus() {
+        let mut app = playing_app();
+        app.switch_view(View::Search);
+        app.search.query_focused = true;
+        dispatch_key(&mut app, KeyCode::Enter);
+        assert!(app.pending_fetch.is_none());
+        assert!(app.search.query_focused);
+        assert!(app.search.message.is_some());
+    }
+
+    #[test]
+    fn esc_leaves_the_query_field() {
+        let mut app = playing_app();
+        app.switch_view(View::Search);
+        app.search.query_focused = true;
+        dispatch_key(&mut app, KeyCode::Esc);
+        assert!(!app.search.query_focused);
+    }
+
+    #[test]
+    fn opening_a_library_section_enqueues_a_fetch() {
+        let mut app = playing_app();
+        app.switch_view(View::Library);
+        // The Library view starts on the section picker; the first section in
+        // display order is Playlists.
+        dispatch_key(&mut app, KeyCode::Enter); // NavOpen via default binding
+        assert_eq!(
+            app.pending_fetch,
+            Some(FetchRequest::LibrarySection {
+                section: crate::api::LibrarySection::Playlists
+            })
+        );
+    }
+
+    #[test]
+    fn apply_fetch_search_error_sets_message() {
+        let mut app = playing_app();
+        app.apply_fetch(FetchOutcome::Search(Err("boom".to_string())));
+        assert_eq!(app.search.message.as_deref(), Some("boom"));
     }
 }
 

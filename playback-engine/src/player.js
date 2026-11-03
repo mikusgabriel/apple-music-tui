@@ -28,6 +28,14 @@
   /** @type {any} */ let music = null;
   /** Track id of the pending/active load, echoed back on every event. */
   let currentTrackId = null;
+  /**
+   * Resolves when the most recent `load` (catalog-id resolution + setQueue) has
+   * finished. The TUI sends `load` and `play` as separate messages; `load` is
+   * async (an API lookup + setQueue), so a `play` that arrives first would run
+   * against the OLD queue and the new track would stay paused. `handlePlay`
+   * awaits this barrier so play always applies to the freshly loaded track.
+   */
+  let pendingLoad = Promise.resolve();
 
   const emit = (event) => bridge.emit(event);
 
@@ -100,19 +108,102 @@
     }
   }
 
+  // Resolve a library song id (`i.*`) to its catalog song id using the Apple
+  // Music API. The library item's `playParams.catalogId` is the catalog track
+  // that plays reliably via `setQueue({ song })`. Returns null when the lookup
+  // fails or the song has no catalog equivalent (e.g. a user upload), in which
+  // case the caller falls back to the library-songs descriptor.
+  async function resolveCatalogId(libraryId, developerToken, musicUserToken) {
+    try {
+      const res = await fetch(
+        'https://api.music.apple.com/v1/me/library/songs/' + encodeURIComponent(libraryId),
+        {
+          headers: {
+            Authorization: 'Bearer ' + (developerToken || ''),
+            'Music-User-Token': musicUserToken || '',
+          },
+        }
+      );
+      if (!res.ok) {
+        console.log('[player] resolveCatalogId HTTP ' + res.status);
+        return null;
+      }
+      const body = await res.json();
+      const item = body && body.data && body.data[0];
+      const catalogId = item && item.attributes && item.attributes.playParams && item.attributes.playParams.catalogId;
+      return typeof catalogId === 'string' && catalogId.length > 0 ? catalogId : null;
+    } catch (err) {
+      console.log('[player] resolveCatalogId error: ' + (err && err.message ? err.message : err));
+      return null;
+    }
+  }
+
   async function handleLoad(command) {
     currentTrackId = command.trackId;
     try {
+      console.log('[player] load trackId=' + command.trackId + ' hasDevToken=' + !!command.developerToken + ' hasMut=' + !!command.musicUserToken);
       await ensureConfigured(command.developerToken, command.musicUserToken);
-      await music.setQueue({ song: command.trackId, startTime: (command.positionMs || 0) / 1000 });
+      console.log('[player] configured; isAuthorized=' + (music && music.isAuthorized) + ' storefront=' + (music && music.storefrontCountryCode));
+
+      const startTime = (command.positionMs || 0) / 1000;
+      const isLibraryId = /^i\./.test(command.trackId);
+
+      // Build an ordered list of queue strategies to try. Library ids can be
+      // played either as a library-songs queue or, when the item has a catalog
+      // equivalent available in the user's storefront, as a catalog `song`.
+      // Neither works for every track (library-songs can report "No playable
+      // items", a catalog id can be "NOT_FOUND" in the storefront), so we try
+      // them in order and keep the first that yields a non-empty queue. This is
+      // what makes playback robust across the occasional problem track.
+      const strategies = [];
+      if (isLibraryId) {
+        strategies.push({ name: 'library-songs', descriptor: { 'library-songs': [command.trackId], startTime } });
+        const catalogId = await resolveCatalogId(command.trackId, command.developerToken, command.musicUserToken);
+        if (catalogId) {
+          strategies.push({ name: 'song(catalog)', descriptor: { song: catalogId, startTime } });
+        }
+      } else {
+        strategies.push({ name: 'song', descriptor: { song: command.trackId, startTime } });
+      }
+
+      let queued = false;
+      let lastErr = null;
+      for (const strategy of strategies) {
+        try {
+          console.log('[player] trying setQueue strategy=' + strategy.name);
+          await music.setQueue(strategy.descriptor);
+          const len = (music.queue && music.queue.length) || 0;
+          if (len > 0) {
+            console.log('[player] setQueue OK via ' + strategy.name + '; duration=' + durationMs() + ' queueLen=' + len);
+            queued = true;
+            break;
+          }
+          console.log('[player] setQueue via ' + strategy.name + ' produced empty queue; trying next');
+        } catch (err) {
+          lastErr = err;
+          console.log('[player] setQueue strategy ' + strategy.name + ' failed: ' + (err && err.message ? err.message : String(err)));
+        }
+      }
+
+      if (!queued) {
+        // No strategy produced a playable queue: surface as unavailable so the
+        // UI can skip rather than appearing to play silence.
+        const text = String((lastErr && (lastErr.message || lastErr.name)) || lastErr || '').toLowerCase();
+        if (/unavailable|not.?found|404|no longer available|no playable/.test(text) || lastErr === null) {
+          emit({ type: 'unavailable', trackId: currentTrackId });
+        } else {
+          emit({ type: 'error', trackId: currentTrackId, kind: classifyError(lastErr) });
+        }
+        return;
+      }
+
       // setQueue drives the DRM license request on the first play; report ready
       // so the main process can transition out of Loading.
       emit({ type: 'ready', trackId: currentTrackId, durationMs: durationMs() });
     } catch (err) {
-      // A missing/unavailable catalog item surfaces as a specific failure; Apple
-      // returns a 404-ish content error for storefront-unavailable tracks.
+      console.log('[player] load ERROR: name=' + (err && err.name) + ' msg=' + (err && err.message) + ' str=' + String(err));
       const text = String((err && (err.message || err.name)) || err || '').toLowerCase();
-      if (/unavailable|not.?found|404|no longer available/.test(text)) {
+      if (/unavailable|not.?found|404|no longer available|no playable/.test(text)) {
         emit({ type: 'unavailable', trackId: currentTrackId });
       } else {
         emit({ type: 'error', trackId: currentTrackId, kind: classifyError(err) });
@@ -121,10 +212,30 @@
   }
 
   async function handlePlay() {
+    // Wait for any in-flight load (catalog-id resolution + setQueue) so play
+    // applies to the newly loaded track rather than racing the old queue.
+    try {
+      await pendingLoad;
+    } catch (_err) {
+      // handleLoad already surfaced its own error; proceed to attempt play.
+    }
     if (!music) return;
     try {
+      // MusicKit rejects play() if the player is already playing ("called
+      // without a previous stop() or pause()"). Treat an already-playing state
+      // as success rather than an error.
+      const states = window.MusicKit && window.MusicKit.PlaybackStates;
+      const playingState = states ? states.playing : 2;
+      if (music.playbackState === playingState) {
+        console.log('[player] play() skipped; already playing');
+        emit({ type: 'playing', trackId: currentTrackId, positionMs: positionMs(), durationMs: durationMs() });
+        return;
+      }
+      console.log('[player] play()');
       await music.play();
+      console.log('[player] play() resolved; state=' + (music.playbackState) + ' pos=' + positionMs());
     } catch (err) {
+      console.log('[player] play ERROR: ' + (err && err.message) + ' / ' + String(err));
       emit({ type: 'error', trackId: currentTrackId, kind: classifyError(err) });
     }
   }
@@ -166,7 +277,10 @@
   bridge.onCommand((command) => {
     switch (command && command.type) {
       case 'load':
-        void handleLoad(command);
+        // Track the in-flight load so a subsequent `play` waits for it. Errors
+        // are handled inside handleLoad; swallow here so the barrier never
+        // rejects (a rejected barrier would block the next play).
+        pendingLoad = handleLoad(command).catch(() => {});
         break;
       case 'play':
         void handlePlay();

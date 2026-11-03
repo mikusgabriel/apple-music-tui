@@ -133,6 +133,7 @@ async fn requests_conform_to_the_protocol_schema() {
             track_id: "track-1".to_string(),
             position_ms: 5_000,
             music_user_token: "mut-abc".to_string(),
+            developer_token: "dev-abc".to_string(),
         })
         .await
         .unwrap();
@@ -149,6 +150,7 @@ async fn requests_conform_to_the_protocol_schema() {
     sender
         .send(&RequestMethod::OpenSignIn {
             developer_token: "dev-jwt".to_string(),
+            storefront: "us".to_string(),
         })
         .await
         .unwrap();
@@ -158,12 +160,13 @@ async fn requests_conform_to_the_protocol_schema() {
     let received = server.await.unwrap();
     assert_eq!(received.len(), 8, "stub engine should read all 8 requests");
 
-    // load {trackId, positionMs, musicUserToken}
+    // load {trackId, positionMs, musicUserToken, developerToken}
     let load = &received[0];
     assert_request_envelope(load, "load");
     assert_eq!(load["params"]["trackId"], "track-1");
     assert_eq!(load["params"]["positionMs"], 5_000);
     assert_eq!(load["params"]["musicUserToken"], "mut-abc");
+    assert_eq!(load["params"]["developerToken"], "dev-abc");
 
     // play {}
     let play = &received[1];
@@ -185,10 +188,11 @@ async fn requests_conform_to_the_protocol_schema() {
     assert_request_envelope(set_volume, "setVolume");
     assert_eq!(set_volume["params"]["level"], 80);
 
-    // openSignIn {developerToken}
+    // openSignIn {developerToken, storefrontId}
     let open_sign_in = &received[5];
     assert_request_envelope(open_sign_in, "openSignIn");
     assert_eq!(open_sign_in["params"]["developerToken"], "dev-jwt");
+    assert_eq!(open_sign_in["params"]["storefrontId"], "us");
 
     // closeSignIn {}
     let close_sign_in = &received[6];
@@ -406,6 +410,7 @@ async fn request_then_matching_notification_round_trips() {
             track_id: "track-42".to_string(),
             position_ms: 7_500,
             music_user_token: "mut".to_string(),
+            developer_token: "dev".to_string(),
         })
         .await
         .unwrap();

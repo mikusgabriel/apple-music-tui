@@ -166,14 +166,14 @@ test('ready signal delivers the developer token to the renderer', () => {
   const rec = makeRecorder();
   const siw = new SignInWindow({ electron, ...rec });
 
-  siw.open('dev-token-xyz');
+  siw.open('dev-token-xyz', 'us');
   const win = siw.window;
 
   ipcMain.emitFrom(CHANNEL_READY, win.webContents);
 
   assert.deepEqual(win.webContents.sent[0], [
     CHANNEL_CONFIG,
-    { developerToken: 'dev-token-xyz' },
+    { developerToken: 'dev-token-xyz', storefrontId: 'us' },
   ]);
 });
 

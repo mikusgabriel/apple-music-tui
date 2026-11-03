@@ -247,7 +247,12 @@ class IpcServer {
     try {
       switch (method) {
         case 'load': {
-          this.playerWindow.load(params.trackId, params.positionMs, params.musicUserToken);
+          this.playerWindow.load(
+            params.trackId,
+            params.positionMs,
+            params.musicUserToken,
+            params.developerToken
+          );
           if (isCall) this._reply(id, { ok: true });
           break;
         }
@@ -280,7 +285,7 @@ class IpcServer {
           // Completion is reported asynchronously via the signInResult
           // notification (design "IPC Protocol"); the call itself returns ok so
           // the client knows the request was accepted.
-          this.signInWindow.open(params.developerToken);
+          this.signInWindow.open(params.developerToken, params.storefrontId);
           if (isCall) this._reply(id, { ok: true });
           break;
         }

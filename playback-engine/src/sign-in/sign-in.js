@@ -40,6 +40,13 @@ async function runAuthorize(opts) {
   const { getMusicKit, bridge, developerToken } = opts;
   const appName = opts.appName || 'apple-music-tui';
   const appBuild = opts.appBuild || '0.1.0';
+  // The storefront country code (e.g. "us"). MusicKit needs this to resolve the
+  // account's storefront during authorize(); without it, authorize() rejects
+  // with "Storefront Country Code error." once the user signs in.
+  const storefrontId =
+    typeof opts.storefrontId === 'string' && opts.storefrontId.trim().length > 0
+      ? opts.storefrontId.trim().toLowerCase()
+      : '';
 
   try {
     const MusicKit = getMusicKit();
@@ -48,10 +55,15 @@ async function runAuthorize(opts) {
       return;
     }
 
-    await MusicKit.configure({
+    const configureOptions = {
       developerToken,
       app: { name: appName, build: appBuild },
-    });
+    };
+    if (storefrontId) {
+      // Supplying the storefront up front; MusicKit v3 reads `storefrontId`.
+      configureOptions.storefrontId = storefrontId;
+    }
+    await MusicKit.configure(configureOptions);
 
     const instance =
       typeof MusicKit.getInstance === 'function' ? MusicKit.getInstance() : null;
@@ -64,14 +76,47 @@ async function runAuthorize(opts) {
     // dismisses the Apple sign-in, it resolves with an empty value — treated as
     // a cancellation (Requirement 1.4).
     const token = await instance.authorize();
-    const normalized = typeof token === 'string' ? token.trim() : '';
+
+    // MusicKit v3 also exposes the captured token on the instance; fall back to
+    // it when authorize() did not return the string directly (some versions
+    // resolve with a non-string once the user is already authorized).
+    let raw = typeof token === 'string' ? token : '';
+    if (raw.trim().length === 0) {
+      const onInstance =
+        instance && typeof instance.musicUserToken === 'string'
+          ? instance.musicUserToken
+          : '';
+      if (onInstance.trim().length > 0) {
+        raw = onInstance;
+      }
+    }
+
+    const normalized = raw.trim();
     if (normalized.length > 0) {
       bridge.reportToken(normalized);
     } else {
       bridge.reportCancelled();
     }
   } catch (err) {
-    const reason = err && err.message ? String(err.message) : 'sign-in failed';
+    // MusicKit can reject with an Error, an MKError-like object, or a plain
+    // string (which appears as an object with numeric character-index keys), so
+    // extract a readable, token-free reason defensively.
+    let reason = err && err.message ? String(err.message) : '';
+    if (!reason) {
+      try {
+        reason =
+          typeof err === 'string'
+            ? err
+            : Array.isArray(err) || (err && typeof err[0] === 'string')
+            ? Array.prototype.join.call(err, '')
+            : String(err);
+      } catch (_e) {
+        reason = String(err);
+      }
+    }
+    if (!reason || reason === '[object Object]') {
+      reason = 'sign-in failed';
+    }
     bridge.reportError(reason);
   }
 }
@@ -133,9 +178,11 @@ function initDom() {
   };
 
   let developerToken = '';
+  let storefrontId = '';
 
   bridge.onConfig((config) => {
     developerToken = (config && config.developerToken) || '';
+    storefrontId = (config && config.storefrontId) || '';
     setStatus('Ready to sign in.');
     if (signInBtn) signInBtn.disabled = false;
   });
@@ -152,6 +199,7 @@ function initDom() {
           getMusicKit: () => MusicKit,
           bridge,
           developerToken,
+          storefrontId,
         });
       } catch (err) {
         bridge.reportError(err && err.message ? String(err.message) : 'MusicKit JS did not load');

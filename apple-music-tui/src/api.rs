@@ -214,8 +214,12 @@ fn map_resource(index: usize, resource: &Value) -> Result<Domain_Object, Dropped
     let artist_name = text_or_empty(attr("artistName"));
     let artwork_url = non_empty_string(artwork_url(attr("artwork")));
 
+    // Apple Music returns catalog resources as `songs`/`albums`/`artists`/
+    // `playlists`, but the user's *library* endpoint returns the same shapes
+    // under `library-songs`/`library-albums`/`library-artists`/
+    // `library-playlists`. Both map to the same Domain_Object, so accept either.
     match resource_type.as_deref() {
-        Some("songs") => Ok(Domain_Object::Song {
+        Some("songs") | Some("library-songs") => Ok(Domain_Object::Song {
             id,
             name,
             artist_name,
@@ -226,18 +230,18 @@ fn map_resource(index: usize, resource: &Value) -> Result<Domain_Object, Dropped
             // so a song without the flag is still offered for playback.
             is_playable: attr("isPlayable").and_then(Value::as_bool).unwrap_or(true),
         }),
-        Some("albums") => Ok(Domain_Object::Album {
+        Some("albums") | Some("library-albums") => Ok(Domain_Object::Album {
             id,
             name,
             artist_name,
             artwork_url,
         }),
-        Some("artists") => Ok(Domain_Object::Artist {
+        Some("artists") | Some("library-artists") => Ok(Domain_Object::Artist {
             id,
             name,
             artwork_url,
         }),
-        Some("playlists") => Ok(Domain_Object::Playlist {
+        Some("playlists") | Some("library-playlists") => Ok(Domain_Object::Playlist {
             id,
             name,
             artwork_url,
@@ -285,6 +289,13 @@ fn duration_millis(value: Option<&Value>) -> Option<u64> {
 
 /// The configured host for Apple Music catalog requests.
 const API_HOST: &str = "https://api.music.apple.com";
+
+/// The web-player origin the Developer_Token is minted for. The unofficial
+/// `api.music.apple.com` endpoint rejects a web-player token (HTTP 401) unless
+/// the request carries the matching `Origin`/`Referer` of the MusicKit JS web
+/// player, which always sends them. Every API request sets these so the scraped
+/// token is accepted (Requirements 2.5, 3.7, 1.13).
+const WEB_PLAYER_ORIGIN: &str = "https://music.apple.com";
 
 /// Maximum items requested per result section per page (Requirement 2.1,
 /// Property 2). Each of songs/albums/artists/playlists is capped at this value.
@@ -766,7 +777,11 @@ impl CatalogApi {
         let mut builder = self
             .client
             .get(request.url())
-            .bearer_auth(developer_token.expose());
+            .bearer_auth(developer_token.expose())
+            // The web-player token is only accepted from its own origin; without
+            // these the endpoint returns 401 (see WEB_PLAYER_ORIGIN).
+            .header("Origin", WEB_PLAYER_ORIGIN)
+            .header("Referer", format!("{WEB_PLAYER_ORIGIN}/"));
         if let Some(token) = music_user_token {
             if !token.is_empty() {
                 builder = builder.header("Music-User-Token", token.expose());
@@ -1795,6 +1810,36 @@ mod tests {
     }
 
     #[test]
+    fn library_resource_types_map_like_their_catalog_counterparts() {
+        // The user's library endpoint returns `library-*` types; these must map
+        // to the same Domain_Objects as the catalog `songs`/`albums`/`artists`/
+        // `playlists` types rather than being dropped (regression: library
+        // playlists showing an empty section).
+        let resources = vec![
+            json!({ "id": "i.1", "type": "library-songs",
+                    "attributes": { "name": "Lib Song", "artistName": "A", "durationInMillis": 1000 } }),
+            json!({ "id": "l.1", "type": "library-albums",
+                    "attributes": { "name": "Lib Album", "artistName": "A" } }),
+            json!({ "id": "r.1", "type": "library-artists",
+                    "attributes": { "name": "Lib Artist" } }),
+            json!({ "id": "p.1", "type": "library-playlists",
+                    "attributes": { "name": "Lib Playlist" } }),
+        ];
+
+        let outcome = map_resources(&resources);
+
+        assert_eq!(outcome.dropped.len(), 0, "no library resource should be dropped");
+        assert_eq!(outcome.objects.len(), 4);
+        assert!(matches!(outcome.objects[0], Domain_Object::Song { .. }));
+        assert!(matches!(outcome.objects[1], Domain_Object::Album { .. }));
+        assert!(matches!(outcome.objects[2], Domain_Object::Artist { .. }));
+        assert!(matches!(
+            &outcome.objects[3],
+            Domain_Object::Playlist { name, .. } if name == "Lib Playlist"
+        ));
+    }
+
+    #[test]
     fn numeric_id_is_accepted_and_stringified() {
         let resource = json!({
             "id": 6006,
@@ -2682,6 +2727,10 @@ impl CatalogApi {
             .client
             .get(request.url())
             .bearer_auth(developer_token.expose())
+            // The web-player token is only accepted from its own origin; without
+            // these the endpoint returns 401 (see WEB_PLAYER_ORIGIN).
+            .header("Origin", WEB_PLAYER_ORIGIN)
+            .header("Referer", format!("{WEB_PLAYER_ORIGIN}/"))
             .header("Music-User-Token", music_user_token.expose());
 
         let response = builder.send().await.map_err(map_library_error)?;

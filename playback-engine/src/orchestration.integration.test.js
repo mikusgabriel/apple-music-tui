@@ -485,14 +485,17 @@ test('openSignIn routed through IPC completes with a captured token -> signInRes
   const { electron, ipcMain } = makeFakeElectron();
   const h = await startEngine({ electron });
   try {
-    const reply = await h.request('openSignIn', { developerToken: 'dev-abc' });
+    const reply = await h.request('openSignIn', { developerToken: 'dev-abc', storefrontId: 'us' });
     assert.deepEqual(reply.result, { ok: true });
 
     // The fake Apple-hosted page became ready and asked for the developer token.
     const win = FakeSignInBrowserWindow.last;
     win.emit('ready-to-show');
     ipcMain.emitFrom(CHANNEL_READY, win.webContents);
-    assert.deepEqual(win.webContents.sent[0], [CHANNEL_CONFIG, { developerToken: 'dev-abc' }]);
+    assert.deepEqual(win.webContents.sent[0], [
+      CHANNEL_CONFIG,
+      { developerToken: 'dev-abc', storefrontId: 'us' },
+    ]);
 
     // The user signs in; the mocked page returns a non-empty Music_User_Token.
     ipcMain.emitFrom(CHANNEL_TOKEN, win.webContents, '  captured-mut-123  ');

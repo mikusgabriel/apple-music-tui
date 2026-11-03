@@ -523,9 +523,11 @@ fn default_binding_specs() -> Vec<(Action, &'static [&'static str])> {
         // Global.
         (Action::Quit, &["q"]),
         (Action::Help, &["?"]),
-        (Action::Search, &["/"]),
-        (Action::OpenLibrary, &["g l"]),
-        (Action::OpenQueue, &["g q"]),
+        // View switching accepts both the mnemonic key/chord and the number
+        // row (1/2/3) as a familiar alternative (Requirement 7.2).
+        (Action::Search, &["/", "1"]),
+        (Action::OpenLibrary, &["g l", "2"]),
+        (Action::OpenQueue, &["g q", "3"]),
         (Action::SignOut, &["g o"]),
         // Transport.
         (Action::PlayPause, &["space"]),
@@ -691,6 +693,82 @@ impl Resolution {
         let sequence = KeySequence::single(key_from_event(event));
         self.action_for(view, &sequence)
     }
+
+    /// Resolve a key press against the bindings in `view`, accounting for the
+    /// two-key sequences (e.g. the default `g l` / `g q` / `g o`).
+    ///
+    /// `pending` is the previously pressed key when the loop is mid-chord (the
+    /// first key of a potential two-key sequence), or `None` for a fresh press.
+    /// The running loop keeps a one-key history and feeds it here so a chord
+    /// like `g` then `l` fires the Library action while a lone `g` is held as a
+    /// pending prefix.
+    ///
+    /// Returns:
+    /// - [`ChordResolution::Action`] when a single-key binding matches `event`
+    ///   directly, or when `pending` + `event` completes a two-key binding;
+    /// - [`ChordResolution::Pending`] when `event` is the first key of some
+    ///   two-key binding in scope (so the loop should hold it and wait for the
+    ///   second key);
+    /// - [`ChordResolution::None`] when nothing matches, so the loop clears any
+    ///   pending prefix and ignores the key.
+    ///
+    /// A completed two-key chord is attempted first so an explicit chord wins
+    /// over a same-first-key single binding; a direct single-key match is tried
+    /// next; only then is the key considered as a new chord prefix.
+    pub fn resolve_chord(
+        &self,
+        view: View,
+        pending: Option<KeyEvent>,
+        event: KeyEvent,
+    ) -> ChordResolution {
+        let key = key_from_event(event);
+
+        // 1. Complete a two-key chord when we already hold a prefix.
+        if let Some(prefix) = pending {
+            let sequence = KeySequence {
+                keys: vec![key_from_event(prefix), key],
+            };
+            if let Some(action) = self.action_for(view, &sequence) {
+                return ChordResolution::Action(action);
+            }
+        }
+
+        // 2. A direct single-key binding.
+        if let Some(action) = self.action_for(view, &KeySequence::single(key)) {
+            return ChordResolution::Action(action);
+        }
+
+        // 3. The key begins some two-key binding in scope: hold it as a prefix.
+        if self.is_chord_prefix(view, key) {
+            return ChordResolution::Pending;
+        }
+
+        ChordResolution::None
+    }
+
+    /// Whether `key` is the first key of any two-key binding active in `view`.
+    fn is_chord_prefix(&self, view: View, key: Key) -> bool {
+        self.bindings.iter().any(|(action, sequences)| {
+            let in_scope = action.view() == View::Global || action.view() == view;
+            in_scope
+                && sequences
+                    .iter()
+                    .any(|s| s.keys.len() == 2 && s.keys[0] == key)
+        })
+    }
+}
+
+/// The outcome of resolving one key press that may be part of a two-key chord
+/// (see [`Resolution::resolve_chord`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChordResolution {
+    /// A binding fired (single key, or a completed two-key chord).
+    Action(Action),
+    /// The key is the first key of a two-key binding; hold it and wait for the
+    /// next press.
+    Pending,
+    /// Nothing matched; clear any pending prefix and ignore the key.
+    None,
 }
 
 /// Build the effective action map from the defaults overlaid with the custom

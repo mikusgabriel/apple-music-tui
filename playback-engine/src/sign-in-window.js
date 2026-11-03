@@ -85,15 +85,28 @@ class SignInWindow {
     this._onError = typeof deps.onError === 'function' ? deps.onError : () => {};
     this._openTimeoutMs =
       typeof deps.openTimeoutMs === 'number' ? deps.openTimeoutMs : OPEN_TIMEOUT_MS;
+    // When set, the page is loaded from this http(s) URL instead of via
+    // `loadFile` (a `file://` origin). MusicKit JS `authorize()` rejects the
+    // `file://` origin with AUTHORIZATION_ERROR, so production serves the assets
+    // over a loopback HTTP origin and passes that URL here. Left null in unit
+    // tests, which stub `loadFile`.
+    this._signInUrl =
+      typeof deps.signInUrl === 'string' && deps.signInUrl.length > 0
+        ? deps.signInUrl
+        : null;
 
     /** @type {import('electron').BrowserWindow|null} */
     this.window = null;
     /** The Developer_Token for the in-flight sign-in (never logged). */
     this._developerToken = null;
+    /** The storefront country code for the in-flight sign-in. */
+    this._storefront = '';
     /** A non-empty Music_User_Token captured during the current flow, if any. */
     this._capturedToken = null;
     /** Guards against reporting a result/error more than once per flow. */
     this._settled = false;
+    /** Guards against showing the window more than once per flow. */
+    this._shown = false;
     /** Timer that fires if the window never becomes ready (Requirement 1.14). */
     this._openTimer = null;
     /** The per-flow IPC handlers, so they can be detached on close. */
@@ -117,6 +130,20 @@ class SignInWindow {
   }
 
   /**
+   * Set the http(s) URL the sign-in page is loaded from. Used by the host
+   * (main.js) which starts the loopback asset server after constructing this
+   * window. When set, [`open`] uses `loadURL` instead of `loadFile` so MusicKit
+   * JS runs on an http origin (its authorize flow rejects `file://`).
+   *
+   * @param {string} url
+   */
+  setSignInUrl(url) {
+    if (typeof url === 'string' && url.length > 0) {
+      this._signInUrl = url;
+    }
+  }
+
+  /**
    * Open the visible sign-in web view and run the MusicKit sign-in flow.
    *
    * Creates a visible, hardened BrowserWindow, loads the MusicKit sign-in page
@@ -127,7 +154,7 @@ class SignInWindow {
    *
    * @param {string} developerToken the Developer_Token used to configure MusicKit
    */
-  open(developerToken) {
+  open(developerToken, storefront) {
     // A sign-in is already in flight: focus the existing window rather than
     // racing two web views for the same token.
     if (this.window) {
@@ -140,8 +167,10 @@ class SignInWindow {
     }
 
     this._developerToken = typeof developerToken === 'string' ? developerToken : '';
+    this._storefront = typeof storefront === 'string' ? storefront : '';
     this._capturedToken = null;
     this._settled = false;
+    this._shown = false;
 
     const electron = this._electron || defaultElectron();
     const { BrowserWindow, ipcMain } = electron;
@@ -187,12 +216,29 @@ class SignInWindow {
       this._openTimer.unref();
     }
 
-    win.once('ready-to-show', () => {
-      this._clearOpenTimer();
-      if (!win.isDestroyed()) {
-        win.show();
+    // Show the window as soon as it is ready. `ready-to-show` is the ideal
+    // trigger (it fires on first paint, avoiding a white flash), but it does
+    // NOT fire for a hidden window on some platforms — notably Wayland with the
+    // GPU disabled, which is exactly how this engine runs. In that case the
+    // window would never show and the open-timeout would fail the sign-in. So
+    // we also show on `did-finish-load` (which fires reliably once the page has
+    // loaded), whichever comes first. `_shown` guards against showing twice.
+    const showOnce = () => {
+      if (this._shown || win.isDestroyed()) {
+        return;
       }
-    });
+      this._shown = true;
+      this._clearOpenTimer();
+      win.show();
+      try {
+        win.focus();
+      } catch (_err) {
+        // focus() can reject on a window mid-lifecycle; not actionable.
+      }
+    };
+
+    win.once('ready-to-show', () => showOnce());
+    win.webContents.once('did-finish-load', () => showOnce());
 
     win.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
       // A failed navigation to the sign-in page is an open/flow error; ignore
@@ -206,9 +252,11 @@ class SignInWindow {
       this._teardown();
     });
 
-    const loadResult = win.loadFile(SIGN_IN_HTML);
-    // loadFile returns a promise in modern Electron; surface a rejection as an
-    // open error rather than an unhandled rejection.
+    const loadResult = this._signInUrl
+      ? win.loadURL(this._signInUrl)
+      : win.loadFile(SIGN_IN_HTML);
+    // loadFile/loadURL return a promise in modern Electron; surface a rejection
+    // as an open error rather than an unhandled rejection.
     if (loadResult && typeof loadResult.catch === 'function') {
       loadResult.catch((err) => {
         this._reportError(this._describeError(err) || 'failed to load sign-in page');
@@ -306,7 +354,10 @@ class SignInWindow {
     if (win.isDestroyed()) {
       return;
     }
-    win.webContents.send(CHANNEL_CONFIG, { developerToken: this._developerToken });
+    win.webContents.send(CHANNEL_CONFIG, {
+      developerToken: this._developerToken,
+      storefrontId: this._storefront,
+    });
   }
 
   /**
