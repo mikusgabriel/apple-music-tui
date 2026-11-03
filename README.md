@@ -38,7 +38,7 @@ Install from a release tarball:
 
 # or over the network (point at the release asset)
 curl -fsSL https://raw.githubusercontent.com/mikusgabriel/apple-music-tui/main/scripts/install.sh \
-  | AMT_TARBALL_URL=https://github.com/mikusgabriel/apple-music-tui/releases/download/v0.1.0/apple-music-tui-0.1.1-linux-x86_64.tar.gz sh
+  | AMT_TARBALL_URL=https://github.com/mikusgabriel/apple-music-tui/releases/download/v0.1.1/apple-music-tui-0.1.1-linux-x86_64.tar.gz sh
 ```
 
 This installs into `~/.local/share/apple-music-tui-app/` and puts an `amt`
