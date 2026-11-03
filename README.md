@@ -2,6 +2,20 @@
 
 A lightweight, keyboard-driven Apple Music client for the Linux terminal.
 
+Search 
+
+<img width="957" height="963" alt="Screenshot From 2026-11-02 22-07-00" src="https://github.com/user-attachments/assets/7649631d-5420-491c-8d6a-575869afd1f5" />
+
+
+Library
+
+<img width="957" height="963" alt="Screenshot From 2026-11-02 22-07-38" src="https://github.com/user-attachments/assets/a9f343c5-8f46-491c-b782-7625c91b8476" />
+
+Queue
+
+<img width="957" height="963" alt="Screenshot From 2026-11-02 22-07-46" src="https://github.com/user-attachments/assets/2eff2b75-fa03-45d5-96d8-17b472b5bcd7" />
+
+
 It is split into two processes:
 
 - **TUI** (`apple-music-tui/`) - a Rust/[ratatui](https://ratatui.rs) terminal app. It owns the UI, the Queue, search/library browsing, configuration, session state, auth tokens, and (optionally) MPRIS media-key integration.
