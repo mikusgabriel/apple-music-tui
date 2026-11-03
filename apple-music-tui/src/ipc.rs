@@ -375,13 +375,24 @@ impl Notification {
 }
 
 fn parse_status(value: Option<&Value>) -> Result<PlaybackStatus, DecodeError> {
-    match value.and_then(Value::as_str) {
+    // The Playback_Engine emits capitalized status strings ("Playing"/"Paused"/
+    // "Stopped"), while earlier protocol fixtures used lower case. Accept either
+    // casing so a casing drift between the two processes never silently breaks
+    // the notification stream (which carries the playback position).
+    match value
+        .and_then(Value::as_str)
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("playing") => Ok(PlaybackStatus::Playing),
         Some("paused") => Ok(PlaybackStatus::Paused),
         Some("stopped") => Ok(PlaybackStatus::Stopped),
-        other => Err(DecodeError::Unrecognized(format!(
-            "stateChanged status {other:?}"
-        ))),
+        _ => {
+            let other = value.and_then(Value::as_str);
+            Err(DecodeError::Unrecognized(format!(
+                "stateChanged status {other:?}"
+            )))
+        }
     }
 }
 
@@ -685,6 +696,33 @@ mod tests {
                 track_id: Some("t1".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn decode_state_changed_accepts_engine_capitalized_status() {
+        // The Playback_Engine emits capitalized status strings; the decoder
+        // must accept them (case-insensitively) so the position stream is not
+        // silently dropped on a casing mismatch between the two processes.
+        for (wire, expected) in [
+            ("Playing", PlaybackStatus::Playing),
+            ("Paused", PlaybackStatus::Paused),
+            ("Stopped", PlaybackStatus::Stopped),
+        ] {
+            let payload = format!(
+                r#"{{"method":"stateChanged","params":{{"status":"{wire}","positionMs":1000,"durationMs":60000,"trackId":"t1"}}}}"#
+            );
+            let notification = Notification::decode(payload.as_bytes()).unwrap();
+            assert_eq!(
+                notification,
+                Notification::StateChanged {
+                    status: expected,
+                    position_ms: 1000,
+                    duration_ms: Some(60000),
+                    track_id: Some("t1".to_string()),
+                },
+                "status {wire:?} should decode"
+            );
+        }
     }
 
     #[test]

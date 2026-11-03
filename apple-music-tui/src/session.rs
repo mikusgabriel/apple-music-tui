@@ -44,6 +44,10 @@ pub struct SerializedTrack {
     pub track_id: String,
     pub title: String,
     pub artist: String,
+    /// The album name, persisted for the Now_Playing_Bar. Defaults to empty for
+    /// session files written before this field existed.
+    #[serde(default)]
+    pub album: String,
     pub duration_ms: Option<u64>,
 }
 
@@ -547,12 +551,14 @@ mod tests {
                         track_id: "1".to_string(),
                         title: "First".to_string(),
                         artist: "Artist A".to_string(),
+                        album: String::new(),
                         duration_ms: Some(210_000),
                     },
                     SerializedTrack {
                         track_id: "2".to_string(),
                         title: "Second".to_string(),
                         artist: "Artist B".to_string(),
+                        album: String::new(),
                         duration_ms: None,
                     },
                 ],
@@ -794,6 +800,7 @@ mod tests {
                     track_id: "1".to_string(),
                     title: "Short".to_string(),
                     artist: "A".to_string(),
+                    album: String::new(),
                     duration_ms: Some(30_000), // 30 seconds
                 }],
             },
@@ -825,6 +832,7 @@ mod tests {
                     track_id: "1".to_string(),
                     title: "Long".to_string(),
                     artist: "A".to_string(),
+                    album: String::new(),
                     duration_ms: Some(300_000), // 300 seconds
                 }],
             },
@@ -853,6 +861,7 @@ mod tests {
                     track_id: "1".to_string(),
                     title: "Unknown".to_string(),
                     artist: "A".to_string(),
+                    album: String::new(),
                     duration_ms: None,
                 }],
             },
@@ -904,6 +913,7 @@ mod tests {
                     track_id: "1".to_string(),
                     title: "T".to_string(),
                     artist: "A".to_string(),
+                    album: String::new(),
                     duration_ms: Some(1000),
                 }],
             },
@@ -964,6 +974,7 @@ mod tests {
                     track_id: "1".to_string(),
                     title: "T".to_string(),
                     artist: "A".to_string(),
+                    album: String::new(),
                     duration_ms: Some(1000),
                 }],
             },
@@ -995,12 +1006,7 @@ mod tests {
     // --- prune unavailable tracks (R9.7) ---
 
     fn strack(id: &str) -> SerializedTrack {
-        SerializedTrack {
-            track_id: id.to_string(),
-            title: format!("Title {id}"),
-            artist: format!("Artist {id}"),
-            duration_ms: Some(180_000),
-        }
+        SerializedTrack { track_id: id.to_string(), title: format!("Title {id}"), artist: format!("Artist {id}"), album: String::new(), duration_ms: Some(180_000) }
     }
 
     fn restored_with(tracks: &[&str], current: Option<usize>) -> RestoredSession {
@@ -1121,6 +1127,7 @@ mod tests {
                 track_id: format!("track-{id}"),
                 title: format!("Title {id}"),
                 artist: format!("Artist {id}"),
+                album: String::new(),
                 duration_ms,
             }
         }
@@ -1407,6 +1414,7 @@ mod round_trip_property_tests {
                 track_id,
                 title,
                 artist,
+                album: String::new(),
                 duration_ms,
             })
     }

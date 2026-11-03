@@ -93,7 +93,7 @@
     if (!music) {
       music = await window.MusicKit.configure({
         developerToken: developerToken || '',
-        app: { name: 'apple-music-tui', build: '0.1.0' },
+        app: { name: 'apple-music-tui', build: '0.1.1' },
       });
       music.addEventListener('playbackStateDidChange', onPlaybackStateChange);
       music.addEventListener('playbackTimeDidChange', onPlaybackTimeChange);

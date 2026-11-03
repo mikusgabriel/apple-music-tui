@@ -19,6 +19,7 @@ pub enum Domain_Object {
         id: String,
         name: String,
         artist_name: String,
+        album_name: String,
         duration_ms: Option<u64>,
         artwork_url: Option<String>,
         is_playable: bool,

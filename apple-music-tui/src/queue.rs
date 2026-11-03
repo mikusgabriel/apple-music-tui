@@ -24,6 +24,7 @@ pub struct QueueTrack {
     pub track_id: String,
     pub title: String,
     pub artist: String,
+    pub album: String,
     pub duration_ms: Option<u64>,
 }
 
@@ -294,6 +295,52 @@ impl Queue {
         permute(&mut self.tracks[suffix_start..]);
     }
 
+    /// Enable shuffle mode across the *entire* Queue, including the first track
+    /// to play (Requirement 5.6, fresh-start case).
+    ///
+    /// Unlike [`Queue::shuffle`] — which fixes the current track and permutes
+    /// only the tracks that follow it — this permutes every track and resets
+    /// the current-track pointer to the new first position. It is the right
+    /// behavior when *starting* a selection with shuffle already enabled, so
+    /// the first track the user hears is random rather than the selection's
+    /// original first track.
+    ///
+    /// Snapshots the pre-shuffle track-id order into [`Queue::pre_shuffle_order`]
+    /// so [`Queue::unshuffle`] can restore the original order. Leaves the Queue
+    /// unchanged (apart from the snapshot) when it holds one or fewer tracks.
+    pub fn shuffle_all(&mut self) {
+        let mut rng = Pcg32::from_time();
+        self.shuffle_all_with(|tracks| fisher_yates(tracks, &mut rng));
+    }
+
+    /// Full-Queue shuffle using a caller-supplied permutation (Requirement 5.6).
+    ///
+    /// Deterministic core of [`Queue::shuffle_all`]: snapshots the pre-shuffle
+    /// order, permutes the whole track list in place, and points `current` at
+    /// the new first track. `permute` receives the entire mutable track slice.
+    pub fn shuffle_all_with<F>(&mut self, permute: F)
+    where
+        F: FnOnce(&mut [QueueTrack]),
+    {
+        // Snapshot the order before any reordering so un-shuffle can restore it.
+        self.pre_shuffle_order = Some(self.tracks.iter().map(|t| t.track_id.clone()).collect());
+
+        if self.current.is_none() {
+            // Empty queue: nothing to permute, snapshot already captured.
+            return;
+        }
+
+        // A single track has nothing to permute; keep the pointer on it.
+        if self.tracks.len() < 2 {
+            self.current = Some(0);
+            return;
+        }
+
+        permute(&mut self.tracks[..]);
+        // The first track becomes the new current track to play.
+        self.current = Some(0);
+    }
+
     /// Disable shuffle mode and restore the pre-shuffle order (Requirement 5.7).
     ///
     /// Restores the track order captured by the last [`Queue::shuffle`],
@@ -531,12 +578,7 @@ mod tests {
     use super::*;
 
     fn track(id: &str) -> QueueTrack {
-        QueueTrack {
-            track_id: id.to_string(),
-            title: format!("Title {id}"),
-            artist: format!("Artist {id}"),
-            duration_ms: Some(180_000),
-        }
+        QueueTrack { track_id: id.to_string(), title: format!("Title {id}"), artist: format!("Artist {id}"), album: String::new(), duration_ms: Some(180_000) }
     }
 
     fn ids(q: &Queue) -> Vec<String> {
@@ -842,6 +884,66 @@ mod tests {
             q.pre_shuffle_order.as_deref(),
             Some(["a".to_string(), "b".to_string(), "c".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn shuffle_all_permutes_whole_queue_and_points_at_new_first() {
+        let mut q = Queue::new();
+        for id in ["a", "b", "c", "d"] {
+            q.add_to_queue(track(id)).unwrap();
+        }
+        q.current = Some(0);
+        // Reverse the entire slice: a,b,c,d -> d,c,b,a.
+        q.shuffle_all_with(reverse_slice);
+        assert_eq!(ids(&q), ["d", "c", "b", "a"]);
+        // The current pointer is reset to the new first track.
+        assert_eq!(q.current, Some(0));
+        assert_eq!(current_id(&q).as_deref(), Some("d"));
+        // The original order is snapshotted for unshuffle.
+        assert_eq!(
+            q.pre_shuffle_order.as_deref(),
+            Some(
+                [
+                    "a".to_string(),
+                    "b".to_string(),
+                    "c".to_string(),
+                    "d".to_string()
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn shuffle_all_then_unshuffle_restores_original_order() {
+        let mut q = Queue::new();
+        for id in ["a", "b", "c", "d"] {
+            q.add_to_queue(track(id)).unwrap();
+        }
+        q.current = Some(0);
+        q.shuffle_all_with(reverse_slice);
+        assert_eq!(ids(&q), ["d", "c", "b", "a"]);
+        q.unshuffle();
+        assert_eq!(ids(&q), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn shuffle_all_single_track_keeps_pointer_on_it() {
+        let mut q = Queue::new();
+        q.add_to_queue(track("only")).unwrap();
+        q.current = Some(0);
+        q.shuffle_all_with(reverse_slice);
+        assert_eq!(ids(&q), ["only"]);
+        assert_eq!(q.current, Some(0));
+    }
+
+    #[test]
+    fn shuffle_all_empty_queue_only_snapshots() {
+        let mut q = Queue::new();
+        q.shuffle_all_with(reverse_slice);
+        assert!(q.is_empty());
+        assert_eq!(q.current, None);
+        assert_eq!(q.pre_shuffle_order.as_deref(), Some([].as_slice()));
     }
 
     #[test]
@@ -1251,12 +1353,7 @@ mod remove_property_tests {
         let mut q = Queue::new();
         for i in 0..n {
             let id = format!("t{i}");
-            q.add_to_queue(QueueTrack {
-                track_id: id.clone(),
-                title: format!("Title {id}"),
-                artist: format!("Artist {id}"),
-                duration_ms: Some(180_000),
-            })
+            q.add_to_queue(QueueTrack { track_id: id.clone(), title: format!("Title {id}"), artist: format!("Artist {id}"), album: String::new(), duration_ms: Some(180_000) })
             .unwrap();
         }
         q.current = Some(current);
@@ -1350,6 +1447,7 @@ mod property_tests {
                 track_id,
                 title,
                 artist,
+                album: String::new(),
                 duration_ms,
             })
     }
@@ -1417,12 +1515,7 @@ mod property_tests {
     fn arb_nonempty_queue_unique_ids() -> impl Strategy<Value = Queue> {
         (1usize..32).prop_flat_map(|len| {
             let tracks: Vec<QueueTrack> = (0..len)
-                .map(|i| QueueTrack {
-                    track_id: format!("t{i}"),
-                    title: format!("Title {i}"),
-                    artist: format!("Artist {i}"),
-                    duration_ms: Some(180_000),
-                })
+                .map(|i| QueueTrack { track_id: format!("t{i}"), title: format!("Title {i}"), artist: format!("Artist {i}"), album: String::new(), duration_ms: Some(180_000) })
                 .collect();
             (Just(tracks), 0..len).prop_map(|(tracks, current)| Queue {
                 tracks,
@@ -1540,12 +1633,7 @@ mod shuffle_roundtrip_property_tests {
     fn arb_nonempty_queue_unique_ids() -> impl Strategy<Value = Queue> {
         (1usize..32).prop_flat_map(|len| {
             let tracks: Vec<QueueTrack> = (0..len)
-                .map(|i| QueueTrack {
-                    track_id: format!("t{i}"),
-                    title: format!("Title {i}"),
-                    artist: format!("Artist {i}"),
-                    duration_ms: Some(180_000),
-                })
+                .map(|i| QueueTrack { track_id: format!("t{i}"), title: format!("Title {i}"), artist: format!("Artist {i}"), album: String::new(), duration_ms: Some(180_000) })
                 .collect();
             (Just(tracks), 0..len).prop_map(|(tracks, current)| Queue {
                 tracks,
@@ -1653,12 +1741,7 @@ mod shuffle_property_tests {
     fn arb_nonempty_queue_unique_ids() -> impl Strategy<Value = Queue> {
         (1usize..32).prop_flat_map(|len| {
             let tracks: Vec<QueueTrack> = (0..len)
-                .map(|i| QueueTrack {
-                    track_id: format!("t{i}"),
-                    title: format!("Title {i}"),
-                    artist: format!("Artist {i}"),
-                    duration_ms: Some(180_000),
-                })
+                .map(|i| QueueTrack { track_id: format!("t{i}"), title: format!("Title {i}"), artist: format!("Artist {i}"), album: String::new(), duration_ms: Some(180_000) })
                 .collect();
             (Just(tracks), 0..len).prop_map(|(tracks, current)| Queue {
                 tracks,
@@ -1760,12 +1843,7 @@ mod transport_property_tests {
         let mut q = Queue::new();
         for i in 0..len {
             let id = format!("t{i}");
-            q.add_to_queue(QueueTrack {
-                track_id: id.clone(),
-                title: format!("Title {id}"),
-                artist: format!("Artist {id}"),
-                duration_ms: Some(180_000),
-            })
+            q.add_to_queue(QueueTrack { track_id: id.clone(), title: format!("Title {id}"), artist: format!("Artist {id}"), album: String::new(), duration_ms: Some(180_000) })
             .unwrap();
         }
         q.current = Some(current);
@@ -1899,12 +1977,7 @@ mod remove_current_property_tests {
     fn arb_nonempty_queue_unique_ids() -> impl Strategy<Value = Queue> {
         (1usize..32).prop_flat_map(|len| {
             let tracks: Vec<QueueTrack> = (0..len)
-                .map(|i| QueueTrack {
-                    track_id: format!("t{i}"),
-                    title: format!("Title {i}"),
-                    artist: format!("Artist {i}"),
-                    duration_ms: Some(180_000),
-                })
+                .map(|i| QueueTrack { track_id: format!("t{i}"), title: format!("Title {i}"), artist: format!("Artist {i}"), album: String::new(), duration_ms: Some(180_000) })
                 .collect();
             (Just(tracks), 0..len).prop_map(|(tracks, current)| Queue {
                 tracks,
@@ -2079,6 +2152,7 @@ mod queue_invariant_stateful_property_tests {
                     track_id: id.clone(),
                     title: format!("Title {id}"),
                     artist: format!("Artist {id}"),
+                    album: String::new(),
                     duration_ms: Some(180_000),
                 })
                 .unwrap();
@@ -2111,6 +2185,7 @@ mod queue_invariant_stateful_property_tests {
                             track_id: id.clone(),
                             title: id.clone(),
                             artist: id.clone(),
+                            album: String::new(),
                             duration_ms: None,
                         });
                         // Count the add only when it actually grew the Queue.
@@ -2129,6 +2204,7 @@ mod queue_invariant_stateful_property_tests {
                             track_id: id.clone(),
                             title: id.clone(),
                             artist: id.clone(),
+                            album: String::new(),
                             duration_ms: None,
                         });
                         if res.is_ok() {

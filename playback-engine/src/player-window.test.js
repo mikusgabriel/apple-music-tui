@@ -56,6 +56,9 @@ function makeHarness() {
   const commands = [];
   const notifications = [];
 
+  // Controllable wall clock. Starts at 0; tests advance it explicitly.
+  let clock = 0;
+
   let eventHandler = null;
   const fakeWindow = {
     send: (command) => commands.push(command),
@@ -86,6 +89,7 @@ function makeHarness() {
       return h;
     },
     clearTimeout: (h) => timeouts.delete(h),
+    now: () => clock,
   };
 
   const player = new PlayerWindow(deps);
@@ -102,6 +106,10 @@ function makeHarness() {
     // Fire every registered interval tick once.
     tickIntervals: () => {
       for (const { fn } of intervals.values()) fn();
+    },
+    // Advance the fake wall clock by `ms` milliseconds.
+    advanceClock: (ms) => {
+      clock += ms;
     },
     // Fire every registered timeout and clear it (one-shot).
     fireTimeouts: () => {
@@ -184,6 +192,75 @@ test('position timer emits stateChanged at least once per second while playing',
   const tick = after.find((n) => n.method === 'stateChanged' && n.params.positionMs === 1000);
   assert.ok(tick, 'the position timer should report the updated position');
   assert.equal(tick.params.status, 'Playing');
+});
+
+test('position timer advances the reported position by the elapsed wall-clock time while playing', () => {
+  const h = makeHarness();
+  h.player.create();
+  h.player.load('t1', 0, 'mut');
+  h.player.play();
+  h.emitEvent({ type: 'playing', trackId: 't1', positionMs: 0, durationMs: 180000 });
+
+  // One second of real time passes, then the timer fires: the reported
+  // position must have advanced by ~1000ms even with no renderer timeupdate.
+  h.advanceClock(1000);
+  h.tickIntervals();
+  const first = h.notifications.filter((n) => n.method === 'stateChanged').pop();
+  assert.equal(first.params.positionMs, 1000, 'position should advance by the elapsed interval');
+
+  // Another two seconds: the position keeps progressing monotonically.
+  h.advanceClock(2000);
+  h.tickIntervals();
+  const second = h.notifications.filter((n) => n.method === 'stateChanged').pop();
+  assert.equal(second.params.positionMs, 3000);
+});
+
+test('a renderer timeupdate re-syncs the advancing baseline to the authoritative position', () => {
+  const h = makeHarness();
+  h.player.create();
+  h.player.load('t1', 0, 'mut');
+  h.player.play();
+  h.emitEvent({ type: 'playing', trackId: 't1', positionMs: 0, durationMs: 180000 });
+
+  // Drift forward locally, then the renderer reports a different real position.
+  h.advanceClock(5000);
+  h.tickIntervals(); // local estimate -> 5000
+  h.emitEvent({ type: 'timeupdate', trackId: 't1', positionMs: 4000, durationMs: 180000 });
+
+  // The next tick advances from the authoritative 4000, not the drifted 5000.
+  h.advanceClock(1000);
+  h.tickIntervals();
+  const latest = h.notifications.filter((n) => n.method === 'stateChanged').pop();
+  assert.equal(latest.params.positionMs, 5000);
+});
+
+test('position never exceeds the known duration when advancing', () => {
+  const h = makeHarness();
+  h.player.create();
+  h.player.load('t1', 0, 'mut');
+  h.player.play();
+  h.emitEvent({ type: 'playing', trackId: 't1', positionMs: 0, durationMs: 2000 });
+
+  h.advanceClock(5000); // overshoot the 2s duration
+  h.tickIntervals();
+  const clamped = h.notifications.filter((n) => n.method === 'stateChanged').pop();
+  assert.equal(clamped.params.positionMs, 2000, 'advance must clamp to duration');
+});
+
+test('a paused timer does not advance the position', () => {
+  const h = makeHarness();
+  h.player.create();
+  h.player.load('t1', 0, 'mut');
+  h.player.play();
+  h.emitEvent({ type: 'playing', trackId: 't1', positionMs: 1000, durationMs: 180000 });
+
+  // Status flips to Paused but suppose the timer ticks once before it stops:
+  // no advance should happen while not Playing.
+  h.player.pause();
+  h.emitEvent({ type: 'paused', trackId: 't1', positionMs: 1000, durationMs: 180000 });
+  assert.equal(h.intervals.size, 0, 'pausing stops the timer');
+  const paused = h.notifications.filter((n) => n.method === 'stateChanged').pop();
+  assert.equal(paused.params.positionMs, 1000);
 });
 
 // ---------------------------------------------------------------------------

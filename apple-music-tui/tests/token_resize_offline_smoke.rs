@@ -616,12 +616,7 @@ fn token_store_keyring_round_trip_when_available() {
 fn populated_app() -> App {
     let mut app = App::new(Session_State::default());
     let mut queue = Queue::new();
-    queue.tracks.push(QueueTrack {
-        track_id: "t1".to_string(),
-        title: "A Very Long Song Title That Must Be Truncated On Narrow Terminals".to_string(),
-        artist: "An Equally Long Artist Name For Good Measure".to_string(),
-        duration_ms: Some(214_000),
-    });
+    queue.tracks.push(QueueTrack { track_id: "t1".to_string(), title: "A Very Long Song Title That Must Be Truncated On Narrow Terminals".to_string(), artist: "An Equally Long Artist Name For Good Measure".to_string(), album: String::new(), duration_ms: Some(214_000) });
     queue.current = Some(0);
     app.queue = queue;
     app.playback = Playback_State {

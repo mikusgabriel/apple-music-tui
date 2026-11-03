@@ -1,6 +1,6 @@
 {
   "name": "apple-music-tui-playback-engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Disposable Electron/Chromium Playback_Engine for apple-music-tui. Runs MusicKit JS for DRM-protected playback and hosts the Sign_In_Window. Supervised by the Rust TUI parent over a length-prefixed JSON-RPC Unix-domain-socket channel.",
   "license": "UNLICENSED",

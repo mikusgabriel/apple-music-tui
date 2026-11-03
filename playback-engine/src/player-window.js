@@ -108,6 +108,9 @@ class PlayerWindow {
     this._clearInterval = deps.clearInterval || clearInterval;
     this._setTimeout = deps.setTimeout || setTimeout;
     this._clearTimeout = deps.clearTimeout || clearTimeout;
+    // Injectable wall clock so the local position estimate advances
+    // deterministically under test. Defaults to Date.now in production.
+    this._now = typeof deps.now === 'function' ? deps.now : Date.now;
 
     /** Transport handle to the renderer (see createWindow). */
     this.window = null;
@@ -123,6 +126,13 @@ class PlayerWindow {
     this._positionTimer = null;
     /** Handle for the per-load 10s timeout, or null when not loading. */
     this._loadTimer = null;
+    /**
+     * Wall-clock time (ms) of the last position advance, or null when the
+     * timer is not running. Used to advance `_positionMs` by the real elapsed
+     * interval between ticks so the reported position progresses even when the
+     * renderer's `playbackTimeDidChange` stream is sparse.
+     */
+    this._lastTickAt = null;
     /** Last positionMs we emitted, to suppress duplicate stateChanged spam. */
     this._lastReportedPositionMs = -1;
   }
@@ -301,6 +311,12 @@ class PlayerWindow {
     }
     if (typeof event.positionMs === 'number') {
       this._positionMs = clampPosition(event.positionMs, this._durationMs);
+      // Re-sync the local estimate's baseline to this authoritative report so
+      // the next timer tick advances from the renderer's real position rather
+      // than accumulating drift.
+      if (this._positionTimer !== null) {
+        this._lastTickAt = this._now();
+      }
     }
   }
 
@@ -336,9 +352,18 @@ class PlayerWindow {
    */
   _startPositionTimer() {
     if (this._positionTimer !== null) return;
+    this._lastTickAt = this._now();
     this._positionTimer = this._setInterval(() => {
-      // Advance a local estimate between renderer timeupdates so a slow event
-      // stream still produces monotonically progressing positions, then report.
+      // Advance a local estimate between renderer timeupdates so a slow (or
+      // silent) event stream still produces monotonically progressing
+      // positions, then report. The advance is the real wall-clock interval
+      // since the last tick, clamped to the known duration.
+      const now = this._now();
+      const elapsed = this._lastTickAt === null ? 0 : Math.max(0, now - this._lastTickAt);
+      this._lastTickAt = now;
+      if (this._status === STATUS_PLAYING && elapsed > 0) {
+        this._positionMs = clampPosition(this._positionMs + elapsed, this._durationMs);
+      }
       this._reportState();
     }, POSITION_REPORT_INTERVAL_MS);
   }
@@ -348,6 +373,7 @@ class PlayerWindow {
       this._clearInterval(this._positionTimer);
       this._positionTimer = null;
     }
+    this._lastTickAt = null;
   }
 
   /**

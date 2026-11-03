@@ -39,10 +39,10 @@ use crossterm::{cursor, execute};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::api::{
@@ -471,6 +471,19 @@ pub struct App {
     /// the authenticated API path, not the engine socket. At most one is
     /// outstanding; a newer request replaces an unstarted older one.
     pub pending_fetch: Option<FetchRequest>,
+    /// The resolved keybindings, used to render the help overlay from the keys
+    /// that are actually in effect (including user overrides), scoped to the
+    /// active view (Requirement 7.3, 7.4). `None` until the loop supplies it via
+    /// [`App::set_keybindings`]; the overlay then falls back to a built-in
+    /// default reference so help is still useful in tests and early startup.
+    pub keybindings: Option<Resolution>,
+    /// Whether a data fetch (search / library open) is currently in flight
+    /// (Requirements 2, 3). Set when the loop begins awaiting a fetch and
+    /// cleared when the result is applied; the nav bar shows an animated
+    /// spinner while it is true so a non-instant open is visibly "loading".
+    pub loading: bool,
+    /// Animation frame for the loading spinner, advanced once per render tick.
+    pub spinner_frame: usize,
 }
 
 /// A data fetch the async loop performs on the app's behalf (Requirements 2, 3).
@@ -553,6 +566,9 @@ impl App {
             pending_requests: Vec::new(),
             pending_chord: None,
             pending_fetch: None,
+            keybindings: None,
+            loading: false,
+            spinner_frame: 0,
         }
     }
 
@@ -571,10 +587,64 @@ impl App {
         self.developer_token = developer_token;
     }
 
+    /// Supply the resolved keybindings so the help overlay reflects the keys
+    /// actually in effect — including the user's config overrides — scoped to
+    /// the active view (Requirements 7.3, 7.4).
+    pub fn set_keybindings(&mut self, resolution: Resolution) {
+        self.keybindings = Some(resolution);
+    }
+
     /// Record a Music_User_Token captured from a successful sign-in so later
     /// `load` requests are authorized (Requirements 1.3, 1.6).
     pub fn set_music_user_token(&mut self, token: String) {
         self.music_user_token = Some(token);
+    }
+
+    /// Apply the Playback_Engine's latest reported playback state into the
+    /// mirrored [`Playback_State`] the Now_Playing_Bar renders (Requirement
+    /// 4.9, 6.2).
+    ///
+    /// The engine authoritatively owns only three fields: playback `status`,
+    /// `position_ms`, and the real stream `duration_ms`. Volume, shuffle,
+    /// repeat, and the track metadata (title/artist/album/track_id) are owned
+    /// by the TUI/Queue and are left untouched here.
+    ///
+    /// `reported_track_id` is the track the engine's report is about. The report
+    /// is applied only when it matches the TUI's current track, so a stale
+    /// report — the engine's initial `Stopped`/position-0 default, or a report
+    /// for a previously playing track — can never clobber the optimistic
+    /// `Playing`/position the TUI set when it just started a new track.
+    ///
+    /// This is also a no-op while an engine error is showing or the TUI is in
+    /// preview-only mode (the engine is not the source of truth then), and
+    /// while there is no current track to describe. A reported `duration_ms` of
+    /// `None` is ignored so a known duration is not blanked by a sparse report.
+    pub fn apply_engine_playback(
+        &mut self,
+        status: PlaybackStatus,
+        position_ms: u64,
+        duration_ms: Option<u64>,
+        reported_track_id: Option<String>,
+    ) {
+        if self.engine_error.is_some() || self.preview_mode {
+            return;
+        }
+        // Only apply reports that are about the track the TUI currently has
+        // loaded. A mismatch (or either side lacking an id) means the report is
+        // stale relative to the UI, so ignoring it keeps the freshly-started
+        // track's state intact.
+        match (&self.playback.track_id, &reported_track_id) {
+            (Some(current), Some(reported)) if current == reported => {}
+            _ => return,
+        }
+        self.playback.status = status;
+        self.playback.position_ms = position_ms;
+        if duration_ms.is_some() {
+            self.playback.duration_ms = duration_ms;
+        }
+        // Keep the persisted session position in step so a quit saves the real
+        // elapsed position (Requirement 9.3).
+        self.session.position_seconds = position_ms / 1000;
     }
 
     /// Set the Developer_Token used to authorize MusicKit for DRM playback in
@@ -714,6 +784,28 @@ impl App {
         }
     }
 
+    /// Auto-advance when the Playback_Engine reports the current track finished
+    /// (Requirement 4.8). Applies [`Queue::track_finished_transition`] under the
+    /// active repeat mode: play the next track, wrap under repeat-all, replay
+    /// under repeat-one, or park paused on the last track when repeat is off.
+    ///
+    /// `finished_track_id` guards against stale/duplicate `trackFinished`
+    /// notifications: the transition is applied only when the finished track is
+    /// still the current one, so a late report for a track the user already
+    /// skipped past cannot derail the queue. Shuffle does not affect this —
+    /// the queue order is already shuffled in place, so advancing to the next
+    /// index follows the shuffled order.
+    pub fn handle_track_finished(&mut self, finished_track_id: &str) {
+        // Ignore reports for a track that is no longer current (e.g. the user
+        // skipped, or a duplicate arrived).
+        if self.playback.track_id.as_deref() != Some(finished_track_id) {
+            return;
+        }
+        if let Some(transition) = self.queue.track_finished_transition(self.playback.repeat) {
+            self.apply_transition(transition);
+        }
+    }
+
     /// Skip to the previous track, honoring the restart threshold (Reqs 4.4/4.5).
     fn previous_track(&mut self) {
         if let Some(transition) = self.queue.previous_transition(self.playback.position_ms) {
@@ -812,6 +904,14 @@ impl App {
     /// enqueues a `load` + `play` when a token is available.
     fn play_queue(&mut self, queue: Queue) {
         self.queue = queue;
+        // When shuffle is already enabled, a freshly started selection must be
+        // shuffled immediately — including which track plays first — instead of
+        // playing in order until the user re-toggles shuffle. `shuffle_all`
+        // randomizes the whole queue and records the pre-shuffle snapshot so a
+        // later unshuffle restores the original order.
+        if self.playback.shuffle {
+            self.queue.shuffle_all();
+        }
         self.queue_view = QueueViewState::for_queue(&self.queue);
         self.playback.position_ms = 0;
         self.playback.status = PlaybackStatus::Playing;
@@ -842,12 +942,14 @@ impl App {
                 id,
                 name,
                 artist_name,
+                album_name,
                 duration_ms,
                 ..
             } => Some(QueueTrack {
                 track_id: id.clone(),
                 title: name.clone(),
                 artist: artist_name.clone(),
+                album: album_name.clone(),
                 duration_ms: *duration_ms,
             }),
             _ => None,
@@ -857,6 +959,8 @@ impl App {
     /// Apply a completed [`FetchOutcome`] to the view state (Requirements 2.3,
     /// 2.5, 3.5, 3.7). Pure view-state mutation; the async loop owns the fetch.
     pub fn apply_fetch(&mut self, outcome: FetchOutcome) {
+        // The in-flight fetch has completed; stop showing the loading spinner.
+        self.loading = false;
         match outcome {
             FetchOutcome::Search(Ok(pagination)) => self.search.set_results(pagination),
             FetchOutcome::Search(Err(message)) => self.search.set_message(message),
@@ -910,7 +1014,7 @@ impl App {
 /// "lost connection"). On the first such report the loop enters preview-only
 /// mode (banner + preview labelling), keeping the Queue and current track
 /// (task 16.2). It is only consulted while no engine error is already showing.
-pub async fn run<F, Fut, W, T, Q, QFut>(
+pub async fn run<F, Fut, W, T, Q, QFut, P, R2>(
     guard: &mut TerminalGuard,
     app: &mut App,
     resolver: &dyn ActionResolver,
@@ -919,6 +1023,8 @@ pub async fn run<F, Fut, W, T, Q, QFut>(
     mut engine_watch: W,
     mut token_watch: T,
     mut fetch: Q,
+    mut playback_watch: P,
+    mut finished_watch: R2,
 ) -> io::Result<LoopOutcome>
 where
     F: FnMut(EngineErrorState) -> Fut,
@@ -927,6 +1033,8 @@ where
     T: FnMut() -> Option<String>,
     Q: FnMut(FetchRequest) -> QFut,
     QFut: std::future::Future<Output = FetchOutcome>,
+    P: FnMut() -> Option<(PlaybackStatus, u64, Option<u64>, Option<String>)>,
+    R2: FnMut() -> Option<String>,
 {
     let mut events = EventStream::new();
     let mut signals = SignalListener::new()?;
@@ -971,6 +1079,7 @@ where
                         // Drawing once before awaiting the fetch shows the
                         // in-progress message (e.g. "searching…") immediately.
                         if let Some(request) = app.pending_fetch.take() {
+                            app.loading = true;
                             draw(guard, app)?;
                             let outcome = fetch(request).await;
                             app.apply_fetch(outcome);
@@ -995,6 +1104,8 @@ where
             // connection detected mid-session degrades to preview-only mode
             // (Requirement 4.10, task 16.2).
             _ = ticker.tick() => {
+                // Advance the loading-spinner animation.
+                app.spinner_frame = app.spinner_frame.wrapping_add(1);
                 if app.engine_error.is_none() {
                     if let Some(failure) = engine_watch() {
                         app.enter_preview_mode(failure);
@@ -1005,6 +1116,21 @@ where
                 // (Requirements 1.3, 1.6).
                 if let Some(token) = token_watch() {
                     app.set_music_user_token(token);
+                }
+                // The current track finished: auto-advance the Queue under the
+                // active repeat mode (Requirement 4.8), then send the resulting
+                // load/play so the next track actually starts.
+                if let Some(finished) = finished_watch() {
+                    app.handle_track_finished(&finished);
+                    send_pending_requests(app, engine).await;
+                }
+                // Pull the Playback_Engine's latest reported status/position/
+                // duration into the mirrored state so the Now_Playing_Bar's
+                // elapsed time advances while a track plays (Requirements 4.9,
+                // 6.2). The engine reports at >= 1 Hz; applying it here keeps the
+                // display current between user actions.
+                if let Some((status, position_ms, duration_ms, track_id)) = playback_watch() {
+                    app.apply_engine_playback(status, position_ms, duration_ms, track_id);
                 }
                 draw(guard, app)?;
             }
@@ -1361,7 +1487,7 @@ fn render_main_view(frame: &mut Frame, app: &App) {
         .constraints(constraints)
         .split(area);
 
-    render_nav_bar(frame, chunks[0], app.view);
+    render_nav_bar(frame, chunks[0], app.view, app.loading, app.spinner_frame);
     let mut idx = 1;
     if let Some(error) = &app.engine_error {
         render_engine_error_banner(frame, chunks[idx], error);
@@ -1371,34 +1497,120 @@ fn render_main_view(frame: &mut Frame, app: &App) {
     render_now_playing(frame, chunks[idx + 1], &app.playback, app.preview_mode);
 
     // The help overlay is drawn last, over the content area, when toggled on
-    // (Requirement 7.3). It lists the default action keys as a quick reference.
+    // (Requirement 7.3). It lists the keys actually in effect for the active
+    // view (plus global bindings), honoring any config overrides.
     if app.show_help {
-        render_help_overlay(frame, chunks[idx]);
+        render_help_overlay(frame, chunks[idx], app);
     }
 }
 
-/// Render a simple help overlay listing the default keybindings (Requirement
-/// 7.3). Drawn over the content area; dismissed by toggling Help again.
-fn render_help_overlay(frame: &mut Frame, area: Rect) {
-    let lines: Vec<&str> = vec![
-        "Help — press ? to close",
-        "",
-        "j / k / ↓ / ↑   move selection",
-        "l / → / Enter   open selected",
-        "h / ←           back",
-        "/               search    g l  library    g q  queue",
-        "Space           play / pause",
-        "n / p           next / previous track",
-        "] / [           seek forward / backward",
-        "+ / -           volume up / down",
-        "s               shuffle    r   cycle repeat",
-        "N / a / x       play-next / add / remove (queue)",
-        "K / J           move up / down (queue)",
-        "g o             sign out   q   quit",
-    ];
-    let text: Vec<Line> = lines.into_iter().map(|l| Line::from(l.to_string())).collect();
-    let block = Block::default().borders(Borders::ALL).title("Help");
-    frame.render_widget(Paragraph::new(text).block(block), area);
+/// Render the help overlay for the active view (Requirements 7.3, 7.4).
+///
+/// The rows are generated from the keybindings actually in effect — the user's
+/// config overrides included — rather than a hardcoded list, so the displayed
+/// keys always match what the app will do. View-scoped bindings for the active
+/// view are listed first, then the global bindings. When the loop has not yet
+/// supplied a resolution (early startup / tests) a built-in default reference is
+/// shown so help is never empty.
+///
+/// The panel is centered over the content area with a `Clear` backdrop, an
+/// aligned two-column `keys — action` layout, and a footer hint.
+fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    // Resolve the entries from the live keybindings, falling back to defaults.
+    let default_resolution;
+    let resolution = match &app.keybindings {
+        Some(resolution) => resolution,
+        None => {
+            default_resolution =
+                keybindings::resolve_keybindings(&crate::config::Configuration::default());
+            &default_resolution
+        }
+    };
+    let overlay = keybindings::HelpOverlay::open(resolution, keybindings_view(app.view));
+    let entries = overlay.entries();
+
+    // Width of the key column, so the action labels line up in a neat column.
+    // Bounded to keep the panel readable on narrow terminals.
+    let key_width = entries
+        .iter()
+        .map(|e| e.keys_display().chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(6, 22);
+
+    let header_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(entries.len() + 2);
+    lines.push(Line::from(Span::styled(
+        format!("{} controls", view_title(app.view)),
+        header_style,
+    )));
+    lines.push(Line::from(""));
+    for entry in entries {
+        let keys = entry.keys_display();
+        let pad = key_width.saturating_sub(keys.chars().count());
+        lines.push(Line::from(vec![
+            Span::styled(keys, key_style),
+            Span::raw(" ".repeat(pad + 2)),
+            Span::raw(entry.label()),
+        ]));
+    }
+
+    // Size the panel to its content, bounded to the available area so it never
+    // overflows a small terminal.
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let panel_w = (content_w + 4).min(area.width.max(1));
+    let panel_h = (lines.len() as u16 + 2).min(area.height.max(1));
+    let panel = centered_rect(panel_w, panel_h, area);
+
+    // Apply the scroll offset so long lists (e.g. the Queue view) stay reachable
+    // even when the panel is shorter than the full entry list.
+    let viewport_rows = panel_h.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(viewport_rows.max(1));
+    let scroll = overlay.scroll().min(max_scroll) as u16;
+
+    // The close/scroll hint lives in the block's bottom border so it is always
+    // visible regardless of how far the entry list is scrolled.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help ")
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" ↑/↓ scroll · ? or Esc to close ").centered());
+
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Paragraph::new(lines).block(block).scroll((scroll, 0)),
+        panel,
+    );
+}
+
+/// The human-readable title for a main view, used in the help panel header.
+fn view_title(view: View) -> &'static str {
+    match view {
+        View::Search => "Search",
+        View::Library => "Library",
+        View::Queue => "Queue",
+    }
+}
+
+/// A `width`x`height` rectangle centered within `area`, clamped so it never
+/// exceeds the available space.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 /// Render the Playback_Engine error banner naming the failure and the restart
@@ -1428,7 +1640,13 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the top navigation bar, highlighting the active view.
-fn render_nav_bar(frame: &mut Frame, area: ratatui::layout::Rect, active: View) {
+fn render_nav_bar(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    active: View,
+    loading: bool,
+    spinner_frame: usize,
+) {
     let mut spans = Vec::new();
     for (idx, view) in View::ALL.iter().enumerate() {
         if idx > 0 {
@@ -1442,6 +1660,22 @@ fn render_nav_bar(frame: &mut Frame, area: ratatui::layout::Rect, active: View) 
         };
         spans.push(ratatui::text::Span::styled(label, style));
     }
+
+    // A small animated spinner on the right edge of the nav bar while a search
+    // or library open is in flight (Requirements 2, 3), so a non-instant fetch
+    // is visibly "loading" instead of looking frozen.
+    if loading {
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let glyph = FRAMES[spinner_frame % FRAMES.len()];
+        spans.push(ratatui::text::Span::raw("   "));
+        spans.push(ratatui::text::Span::styled(
+            format!("{glyph} loading…"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -1729,12 +1963,14 @@ pub fn song_to_queue_track(object: &Domain_Object) -> Option<QueueTrack> {
             id,
             name,
             artist_name,
+            album_name,
             duration_ms,
             ..
         } => Some(QueueTrack {
             track_id: id.clone(),
             title: name.clone(),
             artist: artist_name.clone(),
+            album: album_name.clone(),
             duration_ms: *duration_ms,
         }),
         _ => None,
@@ -2481,6 +2717,7 @@ pub fn queue_from_session(session: &Session_State) -> Queue {
             track_id: t.track_id.clone(),
             title: t.title.clone(),
             artist: t.artist.clone(),
+            album: t.album.clone(),
             duration_ms: t.duration_ms,
         })
         .collect();
@@ -2513,6 +2750,7 @@ pub fn sync_session_queue(session: &mut Session_State, queue: &Queue) {
                 track_id: t.track_id.clone(),
                 title: t.title.clone(),
                 artist: t.artist.clone(),
+                album: t.album.clone(),
                 duration_ms: t.duration_ms,
             })
             .collect(),
@@ -2542,6 +2780,7 @@ pub fn reflect_current_track(playback: &mut Playback_State, queue: &Queue) {
             playback.track_id = Some(track.track_id.clone());
             playback.title = track.title.clone();
             playback.artist = track.artist.clone();
+            playback.album = track.album.clone();
             playback.duration_ms = track.duration_ms;
             if changed {
                 playback.position_ms = 0;
@@ -3015,6 +3254,7 @@ mod tests {
                     track_id: "t1".to_string(),
                     title: "Song".to_string(),
                     artist: "Artist".to_string(),
+                    album: String::new(),
                     duration_ms: Some(200_000),
                 }],
             },
@@ -3183,12 +3423,7 @@ mod tests {
     /// `load` requests are produced, and playing status.
     fn playing_app() -> App {
         let tracks = (0..3)
-            .map(|i| SerializedTrack {
-                track_id: format!("t{i}"),
-                title: format!("Song {i}"),
-                artist: "Artist".to_string(),
-                duration_ms: Some(200_000),
-            })
+            .map(|i| SerializedTrack { track_id: format!("t{i}"), title: format!("Song {i}"), artist: "Artist".to_string(), album: String::new(), duration_ms: Some(200_000) })
             .collect();
         let session = Session_State {
             queue: SerializedQueue { tracks },
@@ -3287,6 +3522,377 @@ mod tests {
         dispatch_key(&mut app, KeyCode::Char('s'));
         assert!(app.playback.shuffle);
         assert!(app.session.shuffle);
+    }
+
+    fn ordered_queue(ids: &[&str]) -> Queue {
+        let tracks = ids
+            .iter()
+            .map(|id| QueueTrack { track_id: (*id).to_string(), title: format!("Title {id}"), artist: "Artist".to_string(), album: String::new(), duration_ms: Some(200_000) })
+            .collect();
+        Queue {
+            tracks,
+            current: Some(0),
+            pre_shuffle_order: None,
+        }
+    }
+
+    #[test]
+    fn play_queue_shuffles_when_shuffle_is_on() {
+        let mut app = playing_app();
+        app.playback.shuffle = true;
+
+        app.play_queue(ordered_queue(&["a", "b", "c", "d", "e", "f"]));
+
+        // Shuffle was applied on start: the pre-shuffle snapshot is recorded
+        // (so unshuffle still works) and still contains every original track.
+        let snapshot = app
+            .queue
+            .pre_shuffle_order
+            .as_ref()
+            .expect("shuffle_all must record the pre-shuffle order");
+        let mut snap_sorted = snapshot.clone();
+        snap_sorted.sort();
+        assert_eq!(snap_sorted, ["a", "b", "c", "d", "e", "f"]);
+
+        // The live queue is a permutation of the same set and a track is current.
+        let mut live: Vec<String> =
+            app.queue.tracks.iter().map(|t| t.track_id.clone()).collect();
+        live.sort();
+        assert_eq!(live, ["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(app.queue.current, Some(0));
+        assert_eq!(app.playback.status, PlaybackStatus::Playing);
+    }
+
+    #[test]
+    fn play_queue_preserves_order_when_shuffle_is_off() {
+        let mut app = playing_app();
+        app.playback.shuffle = false;
+
+        app.play_queue(ordered_queue(&["a", "b", "c", "d"]));
+
+        let live: Vec<&str> =
+            app.queue.tracks.iter().map(|t| t.track_id.as_str()).collect();
+        assert_eq!(live, ["a", "b", "c", "d"]);
+        // No shuffle means no snapshot was taken.
+        assert!(app.queue.pre_shuffle_order.is_none());
+        assert_eq!(app.queue.current, Some(0));
+    }
+
+    #[test]
+    fn apply_engine_playback_updates_position_status_and_duration() {
+        let mut app = playing_app();
+        // A current track is present (playing_app loads t0).
+        reflect_current_track(&mut app.playback, &app.queue);
+        assert_eq!(app.playback.position_ms, 0);
+        let current = app.playback.track_id.clone();
+
+        app.apply_engine_playback(PlaybackStatus::Playing, 42_000, Some(200_000), current);
+
+        assert_eq!(app.playback.position_ms, 42_000);
+        assert_eq!(app.playback.status, PlaybackStatus::Playing);
+        assert_eq!(app.playback.duration_ms, Some(200_000));
+        // The persisted session position tracks the engine (to the second).
+        assert_eq!(app.session.position_seconds, 42);
+    }
+
+    #[test]
+    fn apply_engine_playback_preserves_locally_owned_fields() {
+        let mut app = playing_app();
+        reflect_current_track(&mut app.playback, &app.queue);
+        app.playback.volume = 55;
+        app.playback.shuffle = true;
+        app.playback.repeat = RepeatMode::RepeatAll;
+        let title = app.playback.title.clone();
+        let current = app.playback.track_id.clone();
+
+        app.apply_engine_playback(PlaybackStatus::Paused, 1000, Some(200_000), current);
+
+        // Volume / shuffle / repeat / track metadata are TUI-owned, untouched.
+        assert_eq!(app.playback.volume, 55);
+        assert!(app.playback.shuffle);
+        assert_eq!(app.playback.repeat, RepeatMode::RepeatAll);
+        assert_eq!(app.playback.title, title);
+    }
+
+    #[test]
+    fn apply_engine_playback_ignores_absent_duration() {
+        let mut app = playing_app();
+        reflect_current_track(&mut app.playback, &app.queue);
+        app.playback.duration_ms = Some(200_000);
+        let current = app.playback.track_id.clone();
+
+        app.apply_engine_playback(PlaybackStatus::Playing, 5000, None, current);
+
+        // A None duration must not blank a known duration.
+        assert_eq!(app.playback.duration_ms, Some(200_000));
+        assert_eq!(app.playback.position_ms, 5000);
+    }
+
+    #[test]
+    fn apply_engine_playback_is_a_noop_without_a_current_track() {
+        let mut app = sample_app();
+        // No current track: the bar shows "nothing playing".
+        assert!(app.playback.track_id.is_none());
+
+        app.apply_engine_playback(
+            PlaybackStatus::Playing,
+            9999,
+            Some(200_000),
+            Some("whatever".to_string()),
+        );
+
+        assert_eq!(app.playback.position_ms, 0);
+        assert_eq!(app.playback.status, PlaybackStatus::Stopped);
+    }
+
+    #[test]
+    fn apply_engine_playback_ignores_reports_for_a_different_track() {
+        let mut app = playing_app();
+        reflect_current_track(&mut app.playback, &app.queue);
+        app.playback.status = PlaybackStatus::Playing;
+        app.playback.position_ms = 3000;
+
+        // A stale report for another track (e.g. the engine's initial default
+        // or a previously playing track) must not clobber the current one.
+        app.apply_engine_playback(
+            PlaybackStatus::Stopped,
+            0,
+            None,
+            Some("some-other-track".to_string()),
+        );
+        assert_eq!(app.playback.status, PlaybackStatus::Playing);
+        assert_eq!(app.playback.position_ms, 3000);
+
+        // Likewise a report with no track id (the engine's pre-load default).
+        app.apply_engine_playback(PlaybackStatus::Stopped, 0, None, None);
+        assert_eq!(app.playback.status, PlaybackStatus::Playing);
+        assert_eq!(app.playback.position_ms, 3000);
+    }
+
+    #[test]
+    fn apply_engine_playback_is_a_noop_in_preview_mode() {
+        let mut app = playing_app();
+        reflect_current_track(&mut app.playback, &app.queue);
+        let current = app.playback.track_id.clone();
+        app.enter_preview_mode(crate::preview::EngineFailure::StartFailure);
+
+        app.apply_engine_playback(PlaybackStatus::Playing, 7000, Some(200_000), current);
+
+        // Preview mode owns the position; the engine report is ignored.
+        assert_eq!(app.playback.position_ms, 0);
+    }
+
+    #[test]
+    fn track_finished_advances_to_next_with_repeat_off() {
+        // The exact scenario reported: repeat off, and (independently) shuffle on
+        // must still auto-advance to the following track when one ends.
+        let mut app = playing_app(); // tracks t0,t1,t2, current t0
+        app.playback.repeat = RepeatMode::Off;
+        app.playback.shuffle = true;
+        reflect_current_track(&mut app.playback, &app.queue);
+        assert_eq!(app.playback.track_id.as_deref(), Some("t0"));
+
+        app.handle_track_finished("t0");
+
+        // Advanced to the next track and started playing it.
+        assert_eq!(app.queue.current, Some(1));
+        assert_eq!(app.playback.track_id.as_deref(), Some("t1"));
+        assert_eq!(app.playback.status, PlaybackStatus::Playing);
+        assert_eq!(app.playback.position_ms, 0);
+    }
+
+    #[test]
+    fn track_finished_on_last_track_with_repeat_off_parks_paused() {
+        let mut app = playing_app();
+        app.playback.repeat = RepeatMode::Off;
+        // Move to the last track (t2).
+        app.queue.current = Some(2);
+        reflect_current_track(&mut app.playback, &app.queue);
+
+        app.handle_track_finished("t2");
+
+        // Repeat off on the last track stops, parked paused on it (Req 4.8).
+        assert_eq!(app.queue.current, Some(2));
+        assert_eq!(app.playback.status, PlaybackStatus::Paused);
+    }
+
+    #[test]
+    fn track_finished_wraps_under_repeat_all() {
+        let mut app = playing_app();
+        app.playback.repeat = RepeatMode::RepeatAll;
+        app.queue.current = Some(2); // last track
+        reflect_current_track(&mut app.playback, &app.queue);
+
+        app.handle_track_finished("t2");
+
+        assert_eq!(app.queue.current, Some(0));
+        assert_eq!(app.playback.status, PlaybackStatus::Playing);
+    }
+
+    #[test]
+    fn track_finished_replays_under_repeat_one() {
+        let mut app = playing_app();
+        app.playback.repeat = RepeatMode::RepeatOne;
+        reflect_current_track(&mut app.playback, &app.queue);
+
+        app.handle_track_finished("t0");
+
+        assert_eq!(app.queue.current, Some(0));
+        assert_eq!(app.playback.track_id.as_deref(), Some("t0"));
+        assert_eq!(app.playback.status, PlaybackStatus::Playing);
+    }
+
+    #[test]
+    fn track_finished_ignores_a_stale_report_for_a_non_current_track() {
+        let mut app = playing_app();
+        reflect_current_track(&mut app.playback, &app.queue);
+        assert_eq!(app.queue.current, Some(0));
+
+        // A late/duplicate finish for a track the user already left must not
+        // advance the queue.
+        app.handle_track_finished("some-old-track");
+
+        assert_eq!(app.queue.current, Some(0));
+    }
+
+    /// Render the whole app to an off-screen buffer and return its text rows.
+    fn render_to_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_app(frame, app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut rows = Vec::with_capacity(height as usize);
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            rows.push(line);
+        }
+        rows
+    }
+
+    #[test]
+    fn help_overlay_renders_a_bordered_panel_with_bindings() {
+        let mut app = playing_app();
+        app.set_keybindings(keybindings::resolve_keybindings(
+            &crate::config::Configuration::default(),
+        ));
+        app.show_help = true;
+
+        let rows = render_to_rows(&app, 80, 24);
+        let text = rows.join("\n");
+
+        // The panel is titled and shows the active view's label and the close hint.
+        assert!(text.contains("Help"), "panel should be titled Help:\n{text}");
+        assert!(text.contains("Search controls"), "header missing:\n{text}");
+        assert!(text.contains("to close"), "close hint missing:\n{text}");
+        // A couple of default action labels are present (generated from bindings).
+        assert!(text.contains("Play"), "a Play action label missing:\n{text}");
+        assert!(text.contains("Quit"), "the Quit action label missing:\n{text}");
+    }
+
+    #[test]
+    fn help_overlay_reflects_a_custom_binding_from_config() {
+        use crate::config::Configuration;
+        let mut config = Configuration::default();
+        config
+            .keybindings
+            .insert("quit".to_string(), "ctrl+x".to_string());
+
+        let mut app = playing_app();
+        app.set_keybindings(keybindings::resolve_keybindings(&config));
+        app.show_help = true;
+
+        let text = render_to_rows(&app, 80, 24).join("\n");
+        // The help shows the user's rebound key, not the default `q`.
+        assert!(
+            text.contains("ctrl+x"),
+            "custom quit binding should appear in help:\n{text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_is_view_scoped() {
+        let mut app = playing_app();
+        app.set_keybindings(keybindings::resolve_keybindings(
+            &crate::config::Configuration::default(),
+        ));
+        app.switch_view(View::Queue);
+        app.show_help = true;
+
+        let text = render_to_rows(&app, 80, 24).join("\n");
+        assert!(text.contains("Queue controls"), "header should name the Queue view:\n{text}");
+    }
+
+    #[test]
+    fn selecting_a_song_carries_the_album_into_now_playing() {
+        // A song with an album name becomes the current track; the Now_Playing_Bar
+        // shows the album instead of the "Unknown" placeholder.
+        let song = Domain_Object::Song {
+            id: "s1".to_string(),
+            name: "A Song".to_string(),
+            artist_name: "An Artist".to_string(),
+            album_name: "Great Album".to_string(),
+            duration_ms: Some(200_000),
+            artwork_url: None,
+            is_playable: true,
+        };
+        let queue = song_to_queue(&song).expect("a song builds a queue");
+        assert_eq!(queue.tracks[0].album, "Great Album");
+
+        let mut app = sample_app();
+        app.play_queue(queue);
+        assert_eq!(app.playback.album, "Great Album");
+
+        let text = render_to_rows(&app, 100, 10).join("\n");
+        assert!(
+            text.contains("Great Album"),
+            "the Now_Playing_Bar should show the album:\n{text}"
+        );
+    }
+
+    #[test]
+    fn missing_album_still_falls_back_to_unknown() {
+        let song = Domain_Object::Song {
+            id: "s1".to_string(),
+            name: "A Song".to_string(),
+            artist_name: "An Artist".to_string(),
+            album_name: String::new(),
+            duration_ms: Some(200_000),
+            artwork_url: None,
+            is_playable: true,
+        };
+        let mut app = sample_app();
+        app.play_queue(song_to_queue(&song).unwrap());
+        assert_eq!(app.playback.album, "");
+        // With no album the bar keeps the Unknown placeholder (Requirement 6.7).
+        let text = render_to_rows(&app, 100, 10).join("\n");
+        assert!(text.contains("Unknown"), "blank album should show Unknown:\n{text}");
+    }
+
+    #[test]
+    fn nav_bar_shows_a_loading_spinner_while_fetching() {
+        let mut app = sample_app();
+        app.loading = true;
+        let text = render_to_rows(&app, 80, 10).join("\n");
+        assert!(text.contains("loading"), "nav bar should show a loading hint:\n{text}");
+
+        // When not loading, no spinner is shown.
+        app.loading = false;
+        let text = render_to_rows(&app, 80, 10).join("\n");
+        assert!(!text.contains("loading"), "spinner should be hidden when idle:\n{text}");
+    }
+
+    #[test]
+    fn apply_fetch_clears_the_loading_flag() {
+        let mut app = sample_app();
+        app.loading = true;
+        app.apply_fetch(FetchOutcome::Search(Err("boom".to_string())));
+        assert!(!app.loading, "applying a fetch result must stop the spinner");
     }
 
     #[test]
@@ -3450,14 +4056,7 @@ mod view_tests {
     use crate::api::{validate_query, SearchResults};
 
     fn song(id: &str, dur_ms: Option<u64>) -> Domain_Object {
-        Domain_Object::Song {
-            id: id.to_string(),
-            name: format!("Song {id}"),
-            artist_name: format!("Artist {id}"),
-            duration_ms: dur_ms,
-            artwork_url: None,
-            is_playable: true,
-        }
+        Domain_Object::Song { id: id.to_string(), name: format!("Song {id}"), artist_name: format!("Artist {id}"), album_name: String::new(), duration_ms: dur_ms, artwork_url: None, is_playable: true }
     }
 
     fn album(id: &str) -> Domain_Object {
@@ -3523,14 +4122,7 @@ mod view_tests {
 
     #[test]
     fn blank_name_falls_back_to_unknown() {
-        let s = Domain_Object::Song {
-            id: "1".to_string(),
-            name: String::new(),
-            artist_name: String::new(),
-            duration_ms: None,
-            artwork_url: None,
-            is_playable: true,
-        };
+        let s = Domain_Object::Song { id: "1".to_string(), name: String::new(), artist_name: String::new(), album_name: String::new(), duration_ms: None, artwork_url: None, is_playable: true };
         let text = object_row_text(&s);
         assert!(text.contains(ROW_UNKNOWN));
     }
@@ -4024,12 +4616,7 @@ mod queue_view_tests {
     use crate::domain::PlaybackStatus;
 
     fn qtrack(id: &str, dur_ms: Option<u64>) -> QueueTrack {
-        QueueTrack {
-            track_id: id.to_string(),
-            title: format!("Title {id}"),
-            artist: format!("Artist {id}"),
-            duration_ms: dur_ms,
-        }
+        QueueTrack { track_id: id.to_string(), title: format!("Title {id}"), artist: format!("Artist {id}"), album: String::new(), duration_ms: dur_ms }
     }
 
     fn queue_of(ids: &[&str]) -> Queue {
@@ -4098,12 +4685,7 @@ mod queue_view_tests {
     #[test]
     fn queue_row_missing_duration_and_blank_text_fall_back_to_unknown() {
         let mut q = Queue::new();
-        q.tracks.push(QueueTrack {
-            track_id: "1".to_string(),
-            title: String::new(),
-            artist: String::new(),
-            duration_ms: None,
-        });
+        q.tracks.push(QueueTrack { track_id: "1".to_string(), title: String::new(), artist: String::new(), album: String::new(), duration_ms: None });
         q.current = Some(0);
         let rows = queue_rows(&q);
         match &rows[0] {
@@ -4324,12 +4906,14 @@ mod queue_view_tests {
                         track_id: "a".to_string(),
                         title: "Title a".to_string(),
                         artist: "Artist a".to_string(),
+                        album: String::new(),
                         duration_ms: Some(180_000),
                     },
                     SerializedTrack {
                         track_id: "b".to_string(),
                         title: "Title b".to_string(),
                         artist: "Artist b".to_string(),
+                        album: String::new(),
                         duration_ms: Some(180_000),
                     },
                 ],

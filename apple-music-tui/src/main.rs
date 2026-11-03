@@ -162,6 +162,9 @@ async fn run(config: Configuration) -> std::io::Result<LoopOutcome> {
     for warning in resolution.warnings() {
         ui::log_unrecoverable(&format!("keybinding warning: {warning}"));
     }
+    // The help overlay renders from the resolved bindings (honoring the user's
+    // overrides), so hand the app a copy before the resolver takes ownership.
+    let help_resolution = resolution.clone();
     let resolver = KeybindingActionResolver::new(resolution);
 
     // 3. Read the stored tokens through the Auth_Manager / Token_Store
@@ -192,6 +195,9 @@ async fn run(config: Configuration) -> std::io::Result<LoopOutcome> {
         auth.music_user_token().map(|t| t.expose().to_string()),
         startup_developer_token,
     );
+    // Supply the resolved keybindings so the help overlay (`?`) reflects the
+    // keys actually in effect, including config overrides.
+    app.set_keybindings(help_resolution);
 
     // 4. Spawn and connect the Playback_Engine. On a failure to spawn/connect
     //    (the engine binary is absent or Widevine/Chromium is unavailable) the
@@ -294,6 +300,32 @@ async fn run(config: Configuration) -> std::io::Result<LoopOutcome> {
         Some(token)
     };
 
+    // Poll the shared state for the Playback_Engine's latest reported playback
+    // status/position/duration (set by the notification pump on every
+    // `stateChanged`) so the render loop can feed the Now_Playing_Bar's elapsed
+    // time (Requirements 4.9, 6.2). A `try_lock` keeps the tick non-blocking;
+    // a momentarily contended lock simply defers the update to the next tick.
+    let playback_state = mpris_state.clone();
+    let playback_watch = move || match playback_state.try_lock() {
+        Ok(guard) => Some((
+            guard.playback.status,
+            guard.playback.position_ms,
+            guard.playback.duration_ms,
+            guard.playback.track_id.clone(),
+        )),
+        Err(_) => None,
+    };
+
+    // Poll the shared state for a pending `trackFinished` signal (set by the
+    // notification pump) so the render loop can auto-advance the Queue under the
+    // active repeat mode (Requirement 4.8). A `try_lock` keeps the tick
+    // non-blocking; the signal is taken once so it is handled exactly once.
+    let finished_state = mpris_state.clone();
+    let finished_watch = move || match finished_state.try_lock() {
+        Ok(mut guard) => guard.track_finished.take(),
+        Err(_) => None,
+    };
+
     // The catalog/library API client, built once over a shared connection pool
     // for the storefront in the config. The fetch closure runs search and
     // library requests on the loop's behalf, attaching the Developer_Token and
@@ -328,6 +360,8 @@ async fn run(config: Configuration) -> std::io::Result<LoopOutcome> {
         engine_watch,
         token_watch,
         fetch,
+        playback_watch,
+        finished_watch,
     )
     .await?;
 
@@ -744,7 +778,7 @@ async fn apply_notification(state: &SharedState, notification: Notification) {
             status,
             position_ms,
             duration_ms,
-            ..
+            track_id,
         } => {
             let mut guard = state.lock().await;
             guard.playback.status = status;
@@ -752,6 +786,16 @@ async fn apply_notification(state: &SharedState, notification: Notification) {
             if let Some(duration_ms) = duration_ms {
                 guard.playback.duration_ms = Some(duration_ms);
             }
+            // Record which track this report is about so the render loop can
+            // ignore stale reports for a track that is no longer current.
+            guard.playback.track_id = track_id;
+        }
+        // The current track finished: signal the render loop to auto-advance the
+        // Queue under the active repeat mode (Requirement 4.8). The pump does
+        // not own the authoritative Queue, so it records the finished track id
+        // and the loop applies the transition on its next tick.
+        Notification::TrackFinished { track_id } => {
+            state.lock().await.track_finished = Some(track_id);
         }
         // A successful sign-in carrying a non-empty token: hand it to the render
         // loop via the shared state so post-login transport actions can

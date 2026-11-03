@@ -370,6 +370,12 @@ pub struct MprisState {
     /// requests, without the background pump needing direct access to the UI
     /// state. `None` until a successful sign-in is observed.
     pub captured_music_user_token: Option<String>,
+    /// Set by the notification pump to the track id reported by a
+    /// `trackFinished` notification (Requirement 4.8). The render loop consumes
+    /// it on the next tick to auto-advance the Queue under the active repeat
+    /// mode, then clears it. `None` when no finish is pending. The pump does not
+    /// mutate the UI's authoritative Queue directly; it only signals here.
+    pub track_finished: Option<String>,
 }
 
 /// Shared handle to [`MprisState`], cloned into the zbus interface objects and
@@ -805,12 +811,7 @@ mod tests {
     use crate::queue::QueueTrack;
 
     fn track(id: &str) -> QueueTrack {
-        QueueTrack {
-            track_id: id.to_string(),
-            title: format!("Title {id}"),
-            artist: format!("Artist {id}"),
-            duration_ms: Some(180_000),
-        }
+        QueueTrack { track_id: id.to_string(), title: format!("Title {id}"), artist: format!("Artist {id}"), album: String::new(), duration_ms: Some(180_000) }
     }
 
     fn queue_with(ids: &[&str], current: Option<usize>) -> Queue {
@@ -1106,6 +1107,7 @@ mod tests {
             track_id: Some("abc".to_string()),
             title: "Song".to_string(),
             artist: "Artist".to_string(),
+            album: String::new(),
             duration_ms: Some(180_000),
             ..Default::default()
         };

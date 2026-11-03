@@ -223,6 +223,9 @@ fn map_resource(index: usize, resource: &Value) -> Result<Domain_Object, Dropped
             id,
             name,
             artist_name,
+            // The album the song belongs to; missing text -> empty string
+            // (Requirement 12.2). Shown in the Now_Playing_Bar.
+            album_name: text_or_empty(attr("albumName")),
             // Missing duration -> no value (Requirement 12.2).
             duration_ms: duration_millis(attr("durationInMillis")),
             artwork_url,
@@ -1487,14 +1490,7 @@ mod search_property_tests {
         /// defaults to `true` (Requirement 12.1, 12.2).
         fn expected(&self) -> Domain_Object {
             match self.kind {
-                Kind::Song => Domain_Object::Song {
-                    id: self.id.clone(),
-                    name: self.name.clone(),
-                    artist_name: self.artist_name.clone().unwrap_or_default(),
-                    duration_ms: self.duration_ms,
-                    artwork_url: self.artwork_url.clone(),
-                    is_playable: self.is_playable.unwrap_or(true),
-                },
+                Kind::Song => Domain_Object::Song { id: self.id.clone(), name: self.name.clone(), artist_name: self.artist_name.clone().unwrap_or_default(), album_name: String::new(), duration_ms: self.duration_ms, artwork_url: self.artwork_url.clone(), is_playable: self.is_playable.unwrap_or(true) },
                 Kind::Album => Domain_Object::Album {
                     id: self.id.clone(),
                     name: self.name.clone(),
@@ -1616,6 +1612,7 @@ mod tests {
             "attributes": {
                 "name": "Clair de Lune",
                 "artistName": "Claude Debussy",
+                "albumName": "Suite Bergamasque",
                 "durationInMillis": 300000u64,
                 "artwork": { "url": "https://example.com/art.jpg" },
                 "isPlayable": true
@@ -1631,6 +1628,7 @@ mod tests {
                 id: "1001".to_string(),
                 name: "Clair de Lune".to_string(),
                 artist_name: "Claude Debussy".to_string(),
+                album_name: "Suite Bergamasque".to_string(),
                 duration_ms: Some(300000),
                 artwork_url: Some("https://example.com/art.jpg".to_string()),
                 is_playable: true,
@@ -1657,6 +1655,7 @@ mod tests {
                 id: "2002".to_string(),
                 name: "Untitled".to_string(),
                 artist_name: String::new(),
+                album_name: String::new(),
                 duration_ms: None,
                 artwork_url: None,
                 is_playable: true,
@@ -2064,14 +2063,7 @@ mod pagination_tests {
     use serde_json::json;
 
     fn song(id: &str) -> Domain_Object {
-        Domain_Object::Song {
-            id: id.to_string(),
-            name: format!("Song {id}"),
-            artist_name: String::new(),
-            duration_ms: None,
-            artwork_url: None,
-            is_playable: true,
-        }
+        Domain_Object::Song { id: id.to_string(), name: format!("Song {id}"), artist_name: String::new(), album_name: String::new(), duration_ms: None, artwork_url: None, is_playable: true }
     }
 
     fn first_page(songs: usize, more: bool) -> SearchPagination {
@@ -2754,14 +2746,7 @@ mod library_tests {
     use serde_json::json;
 
     fn song(id: &str) -> Domain_Object {
-        Domain_Object::Song {
-            id: id.to_string(),
-            name: format!("Song {id}"),
-            artist_name: String::new(),
-            duration_ms: None,
-            artwork_url: None,
-            is_playable: true,
-        }
+        Domain_Object::Song { id: id.to_string(), name: format!("Song {id}"), artist_name: String::new(), album_name: String::new(), duration_ms: None, artwork_url: None, is_playable: true }
     }
 
     fn page_body(count: usize, kind: &str, next: bool) -> Value {
@@ -3076,6 +3061,7 @@ mod library_property_tests {
                             id,
                             name: String::new(),
                             artist_name: String::new(),
+                            album_name: String::new(),
                             duration_ms: None,
                             artwork_url: None,
                             is_playable: true,

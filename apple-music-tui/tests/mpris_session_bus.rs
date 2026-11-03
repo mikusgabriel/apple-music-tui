@@ -257,6 +257,7 @@ fn track(id: &str, title: &str, artist: &str, duration_ms: Option<u64>) -> Queue
         track_id: id.to_string(),
         title: title.to_string(),
         artist: artist.to_string(),
+        album: String::new(),
         duration_ms,
     }
 }
@@ -432,6 +433,7 @@ async fn forwards_play_pause_playpause_to_engine() {
         track_id: Some("t1".to_string()),
         title: "Song".to_string(),
         artist: "Artist".to_string(),
+        album: String::new(),
         duration_ms: Some(180_000),
         status: PlaybackStatus::Playing,
         ..Default::default()
