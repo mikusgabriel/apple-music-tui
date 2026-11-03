@@ -435,26 +435,6 @@ function createElectronPlayerWindow() {
   };
   ipcMain.on(EVENT_CHANNEL, onIpc);
 
-  // TEMP DIAG: capture the player renderer console so the MusicKit load/play
-  // path is observable (engine stdout/stderr go to /dev/null under the TUI).
-  try {
-    const fs = require('fs');
-    const os = require('os');
-    const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
-    const dir = path.join(base, 'apple-music-tui');
-    fs.mkdirSync(dir, { recursive: true });
-    const logPath = path.join(dir, 'engine-diag.log');
-    win.webContents.on('console-message', (_e, level, message) => {
-      try {
-        fs.appendFileSync(logPath, `${new Date().toISOString()} PLAYER[${level}]: ${message}\n`);
-      } catch (_err) {
-        // ignore
-      }
-    });
-  } catch (_err) {
-    // diagnostics must never break playback
-  }
-
   win.loadFile(path.join(__dirname, 'player.html'));
 
   return {

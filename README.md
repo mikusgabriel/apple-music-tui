@@ -9,6 +9,53 @@ It is split into two processes:
 
 The TUI launches the engine for you; you do not run it by hand.
 
+## Install (prebuilt release)
+
+The easiest way to run apple-music-tui is the self-contained release tarball. It
+bundles the TUI binary **and** the Electron playback engine (including the
+Widevine-enabled runtime), so you do **not** need Rust, Node, or npm installed to
+use it — only to build it.
+
+Install from a release tarball:
+
+```bash
+# from a downloaded tarball
+./scripts/install.sh apple-music-tui-<version>-linux-<arch>.tar.gz
+
+# or over the network (point at the release asset)
+curl -fsSL <install.sh-url> | AMT_TARBALL_URL=<tarball-url> sh
+```
+
+This installs into `~/.local/share/apple-music-tui-app/` and puts an `amt`
+launcher in `~/.local/bin/`. If `~/.local/bin` is on your `PATH`, just run:
+
+```bash
+amt
+```
+
+Uninstall:
+
+```bash
+rm -rf ~/.local/share/apple-music-tui-app ~/.local/bin/amt
+```
+
+### Building the release tarball yourself
+
+Requires `cargo`, `node`, and `npm` (build-time only). From the workspace root:
+
+```bash
+scripts/build-release.sh
+```
+
+This produces `dist/apple-music-tui-<version>-linux-<arch>.tar.gz` containing the
+release binary, the engine with its `node_modules` (Electron + Widevine), and the
+`amt` launcher. The launcher sets `AMT_ENGINE_DIR` so the binary finds the bundled
+engine wherever it is installed.
+
+## Running from source
+
+The sections below describe running from a source checkout (for development).
+
 ## Requirements
 
 - Linux (uses XDG paths, Unix domain sockets, and optionally a D-Bus session bus for MPRIS).
