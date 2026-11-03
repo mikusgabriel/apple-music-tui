@@ -457,16 +457,37 @@ async fn remove_stale_engine_socket() {
 
 /// Launch the Electron Playback_Engine child process.
 ///
-/// The engine lives in the sibling `playback-engine` npm project and is started
-/// with `npm start` (which runs `electron .`). `AMT_PARENT_PID` is exported so
-/// the engine's parent-loss watcher terminates it within 5 seconds if the TUI
-/// dies (Requirement 10.7). The engine resolves the same socket path we connect
-/// to from `XDG_RUNTIME_DIR` (ipc.rs / the engine's `resolveSocketPath` agree).
+/// Prefers running the Electron binary bundled in the engine's `node_modules`
+/// directly (so a packaged install needs no `npm` on PATH at runtime). Falls
+/// back to `npm start` for a source checkout where only the project is present.
+/// `AMT_PARENT_PID` is exported so the engine's parent-loss watcher terminates
+/// it within 5 seconds if the TUI dies (Requirement 10.7). The engine resolves
+/// the same socket path we connect to from `XDG_RUNTIME_DIR` (ipc.rs / the
+/// engine's `resolveSocketPath` agree).
 fn spawn_engine_process() -> std::io::Result<Child> {
     let dir = playback_engine_dir();
-    Command::new("npm")
-        .arg("start")
-        .arg("--silent")
+
+    // Prefer the bundled Electron binary so no `npm`/global toolchain is needed
+    // at runtime. `electron .` runs the project's `main` entry point.
+    let electron_candidates = [
+        dir.join("node_modules/.bin/electron"),
+        dir.join("node_modules/electron/dist/electron"),
+    ];
+    let electron_bin = electron_candidates.into_iter().find(|p| p.is_file());
+
+    let mut command = if let Some(bin) = electron_bin {
+        let mut c = Command::new(bin);
+        c.arg(".");
+        c
+    } else {
+        // Dev fallback: run via npm when the Electron binary is not present as a
+        // file (e.g. a bare source checkout before `npm install`).
+        let mut c = Command::new("npm");
+        c.arg("start").arg("--silent");
+        c
+    };
+
+    command
         .current_dir(&dir)
         // Export our PID so the engine watches the right parent (Requirement
         // 10.7); it falls back to `process.ppid` when this is absent.
@@ -480,13 +501,61 @@ fn spawn_engine_process() -> std::io::Result<Child> {
         .spawn()
 }
 
-/// Resolve the `playback-engine` project directory relative to the running
-/// binary's workspace. Falls back to a path relative to the current directory
-/// so a `cargo run` from the workspace root also finds it.
+/// Resolve the `playback-engine` project directory, supporting both a packaged
+/// install and a `cargo run` from the source tree.
+///
+/// Lookup order (first existing directory wins):
+/// 1. `$AMT_ENGINE_DIR` — set explicitly by the install launcher. This is the
+///    authoritative override for a packaged install.
+/// 2. Next to the running binary: `<bindir>/playback-engine` and
+///    `<bindir>/../libexec/apple-music-tui/playback-engine` and
+///    `<bindir>/../share/apple-music-tui/playback-engine` — the common
+///    self-contained and FHS-style install layouts.
+/// 3. `$XDG_DATA_HOME/apple-music-tui-app/playback-engine` (or
+///    `~/.local/share/apple-music-tui-app/playback-engine`) — the default
+///    per-user install location used by `install.sh`.
+/// 4. The source-tree layout: the engine as a sibling of the crate dir
+///    (`CARGO_MANIFEST_DIR`'s parent), so `cargo run` keeps working.
+/// 5. `./playback-engine` relative to the current directory, as a last resort.
 fn playback_engine_dir() -> PathBuf {
-    // In the workspace layout the engine is a sibling of the `apple-music-tui`
-    // crate at `<workspace>/playback-engine`. `CARGO_MANIFEST_DIR` points at the
-    // crate dir at build time; its parent is the workspace root.
+    // 1. Explicit override from the launcher (packaged install).
+    if let Some(dir) = std::env::var_os("AMT_ENGINE_DIR") {
+        let candidate = PathBuf::from(dir);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+
+    // 2. Relative to the running executable, covering common install layouts.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bindir) = exe.parent() {
+            let candidates = [
+                bindir.join("playback-engine"),
+                bindir.join("../libexec/apple-music-tui/playback-engine"),
+                bindir.join("../share/apple-music-tui/playback-engine"),
+                bindir.join("../lib/apple-music-tui/playback-engine"),
+            ];
+            for candidate in candidates {
+                if candidate.is_dir() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    // 3. The default per-user install location used by install.sh.
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    if let Some(data_home) = data_home {
+        let candidate = data_home.join("apple-music-tui-app/playback-engine");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+
+    // 4. Source-tree layout: engine is a sibling of the crate dir. This keeps
+    //    `cargo run` working from the workspace.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if let Some(workspace) = manifest_dir.parent() {
         let candidate = workspace.join("playback-engine");
@@ -494,6 +563,8 @@ fn playback_engine_dir() -> PathBuf {
             return candidate;
         }
     }
+
+    // 5. Last resort: relative to the current directory.
     PathBuf::from("playback-engine")
 }
 
